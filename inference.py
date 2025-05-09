@@ -1,5 +1,6 @@
 import torch
 import argparse
+from PIL import Image
 from hi_diffusers import HiDreamImagePipeline
 from hi_diffusers import HiDreamImageTransformer2DModel
 from hi_diffusers.schedulers.fm_solvers_unipc import FlowUniPCMultistepScheduler
@@ -115,14 +116,22 @@ def generate_image(pipe, model_type, prompt, resolution, seed):
     
     generator = torch.Generator("cuda").manual_seed(seed)
     
+
+    prompt = "A SKS on the car"
+    subject_images = [Image.open("./test_imgs/subject_1.png").convert("RGB")]
+    spatial_images = [Image.open("./test_imgs/inpainting.png").convert("RGB")]
+    # subject_images = []
     images = pipe(
         prompt,
-        height=height,
-        width=width,
+        height=1024,
+        width=1024,
         guidance_scale=guidance_scale,
         num_inference_steps=num_inference_steps,
         num_images_per_prompt=1,
-        generator=generator
+        generator=generator,
+        subject_images=subject_images,
+        spatial_images=spatial_images,
+        cond_size=512,        
     ).images
     
     return images[0], seed
