@@ -364,6 +364,8 @@ class HiDreamImageTransformer2DModel(
     def forward(
         self,
         hidden_states: torch.Tensor,
+        cond_hidden_states: torch.Tensor = None,
+        cond_img_ids: torch.Tensor = None,
         timesteps: torch.LongTensor = None,
         encoder_hidden_states: torch.Tensor = None,
         pooled_embeds: torch.Tensor = None,
@@ -372,6 +374,10 @@ class HiDreamImageTransformer2DModel(
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ):
+        
+        # Check if conditioning is enabled
+        use_condition = cond_hidden_states is not None
+            
         if joint_attention_kwargs is not None:
             joint_attention_kwargs = joint_attention_kwargs.copy()
             lora_scale = joint_attention_kwargs.pop("scale", 1.0)
@@ -398,13 +404,24 @@ class HiDreamImageTransformer2DModel(
         adaln_input = timesteps + p_embedder
 
         hidden_states, image_tokens_masks, img_sizes = self.patchify(hidden_states, self.max_seq, img_sizes)
+
         if image_tokens_masks is None:
             pH, pW = img_sizes[0]
             img_ids = torch.zeros(pH, pW, 3, device=hidden_states.device)
             img_ids[..., 1] = img_ids[..., 1] + torch.arange(pH, device=hidden_states.device)[:, None]
             img_ids[..., 2] = img_ids[..., 2] + torch.arange(pW, device=hidden_states.device)[None, :]
             img_ids = repeat(img_ids, "h w c -> b (h w) c", b=batch_size)
+
         hidden_states = self.x_embedder(hidden_states)
+        
+        if use_condition:
+            latents_to_concat = []
+            for i in range(cond_hidden_states.shape[0]):
+                cond_latent, cond_tokens_masks, cond_size = self.patchify(cond_hidden_states[i], self.max_seq)
+                latents_to_concat.append(cond_latent)
+            cond_hidden_states = torch.concat(latents_to_concat, dim=-2)
+            cond_hidden_states = self.x_embedder(cond_hidden_states)
+
 
         T5_encoder_hidden_states = encoder_hidden_states[0]
         encoder_hidden_states = encoder_hidden_states[-1]
