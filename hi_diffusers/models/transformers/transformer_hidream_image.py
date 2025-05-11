@@ -149,15 +149,22 @@ class HiDreamImageTransformerBlock(nn.Module):
     def forward(
         self,
         image_tokens: torch.FloatTensor,
+        cond_tokens: Optional[torch.FloatTensor] = None,
         image_tokens_masks: Optional[torch.FloatTensor] = None,
         text_tokens: Optional[torch.FloatTensor] = None,
         adaln_input: Optional[torch.FloatTensor] = None,
+        cond_adaln_input: Optional[torch.FloatTensor] = None,
         rope: torch.FloatTensor = None,
     ) -> torch.FloatTensor:
+        use_cond = cond_tokens is not None
         wtype = image_tokens.dtype
         shift_msa_i, scale_msa_i, gate_msa_i, shift_mlp_i, scale_mlp_i, gate_mlp_i, \
         shift_msa_t, scale_msa_t, gate_msa_t, shift_mlp_t, scale_mlp_t, gate_mlp_t = \
             self.adaLN_modulation(adaln_input)[:,None].chunk(12, dim=-1)
+        
+        if use_cond:
+            cond_shift_msa_i, cond_scale_msa_i, cond_gate_msa_i, cond_shift_mlp_i, cond_scale_mlp_i, cond_gate_mlp_i,\
+            _, _, _, _, _, _ = self.adaLN_modulation(cond_adaln_input)[:, None].chunk(12, dim=-1)
         
         # 1. MM-Attention
         norm_image_tokens = self.norm1_i(image_tokens).to(dtype=wtype)
@@ -165,27 +172,44 @@ class HiDreamImageTransformerBlock(nn.Module):
         norm_text_tokens = self.norm1_t(text_tokens).to(dtype=wtype)
         norm_text_tokens = norm_text_tokens * (1 + scale_msa_t) + shift_msa_t
 
-        attn_output_i, attn_output_t = self.attn1(
+        if use_cond:
+            norm_cond_tokens = self.norm1_i(cond_tokens).to(dtype=wtype)
+            norm_cond_tokens = norm_cond_tokens * (1 + cond_scale_msa_i) + cond_shift_msa_i
+            norm_image_tokens = torch.concat([norm_image_tokens, norm_cond_tokens], dim=-2)
+
+        attn_output = self.attn1(
             norm_image_tokens,
             image_tokens_masks,
             norm_text_tokens,
             rope = rope,
         )
 
+        attn_output_i, attn_output_t = attn_output[:2]
+        cond_attn_output = attn_output[2] if use_cond else None
+
         image_tokens = gate_msa_i * attn_output_i + image_tokens
         text_tokens = gate_msa_t * attn_output_t + text_tokens
+        if use_cond:
+            cond_tokens = cond_gate_msa_i * cond_attn_output + cond_tokens
         
         # 2. Feed-forward
         norm_image_tokens = self.norm3_i(image_tokens).to(dtype=wtype)
         norm_image_tokens = norm_image_tokens * (1 + scale_mlp_i) + shift_mlp_i
         norm_text_tokens = self.norm3_t(text_tokens).to(dtype=wtype)
         norm_text_tokens = norm_text_tokens * (1 + scale_mlp_t) + shift_mlp_t
+        if use_cond:
+            norm_cond_tokens = self.norm3_i(cond_tokens).to(dtype=wtype)
+            norm_cond_tokens = norm_cond_tokens * (1 + cond_scale_mlp_i) + cond_shift_mlp_i
 
         ff_output_i = gate_mlp_i * self.ff_i(norm_image_tokens)
         ff_output_t = gate_mlp_t * self.ff_t(norm_text_tokens)
         image_tokens = ff_output_i + image_tokens
         text_tokens = ff_output_t + text_tokens
-        return image_tokens, text_tokens
+        if use_cond:
+            cond_ff_output = cond_gate_mlp_i * self.ff_i(norm_cond_tokens)
+            cond_tokens = cond_ff_output + cond_tokens
+
+        return image_tokens, text_tokens, cond_tokens
     
 @maybe_allow_in_graph
 class HiDreamImageBlock(nn.Module):
@@ -214,16 +238,20 @@ class HiDreamImageBlock(nn.Module):
     def forward(
         self,
         image_tokens: torch.FloatTensor,
+        cond_tokens: Optional[torch.FloatTensor] = None,
         image_tokens_masks: Optional[torch.FloatTensor] = None,
         text_tokens: Optional[torch.FloatTensor] = None,
         adaln_input: torch.FloatTensor = None,
+        cond_adaln_input: Optional[torch.FloatTensor] = None,
         rope: torch.FloatTensor = None,
     ) -> torch.FloatTensor:
         return self.block(
             image_tokens,
+            cond_tokens,
             image_tokens_masks,
             text_tokens,
             adaln_input,
+            cond_adaln_input,
             rope,
         )
 
@@ -399,9 +427,12 @@ class HiDreamImageTransformer2DModel(
 
         # 0. time
         timesteps = self.expand_timesteps(timesteps, batch_size, hidden_states.device)
+        cond_timesteps = torch.ones_like(timesteps) * 0
         timesteps = self.t_embedder(timesteps, hidden_states_type)
         p_embedder = self.p_embedder(pooled_embeds)
         adaln_input = timesteps + p_embedder
+        cond_timesteps = self.t_embedder(cond_timesteps, hidden_states_type)
+        cond_adaln_input = timesteps + p_embedder
 
         hidden_states, image_tokens_masks, img_sizes = self.patchify(hidden_states, self.max_seq, img_sizes)
 
@@ -421,6 +452,7 @@ class HiDreamImageTransformer2DModel(
                 latents_to_concat.append(cond_latent)
             cond_hidden_states = torch.concat(latents_to_concat, dim=-2)
             cond_hidden_states = self.x_embedder(cond_hidden_states)
+            img_ids = torch.concat([img_ids, cond_img_ids], dim=-2)
 
 
         T5_encoder_hidden_states = encoder_hidden_states[0]
@@ -464,22 +496,37 @@ class HiDreamImageTransformer2DModel(
                     return custom_forward
                 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                hidden_states, initial_encoder_hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    hidden_states,
-                    image_tokens_masks,
-                    cur_encoder_hidden_states,
-                    adaln_input,
-                    rope,
-                    **ckpt_kwargs,
-                )
+                if use_condition:
+                    hidden_states, initial_encoder_hidden_states, cond_hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        hidden_states,             # image_tokens
+                        image_tokens_masks,        # image_tokens_masks
+                        cur_encoder_hidden_states, # text_tokens
+                        adaln_input,               # adaln_input
+                        rope,                      # rope
+                        cond_hidden_states,        # cond_tokens
+                        cond_adaln_input,          # cond_adaln_input
+                        **ckpt_kwargs,
+                    )
+                else:
+                    hidden_states, initial_encoder_hidden_states, cond_hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        hidden_states,             # image_tokens
+                        image_tokens_masks,        # image_tokens_masks
+                        cur_encoder_hidden_states, # text_tokens
+                        adaln_input,               # adaln_input
+                        rope,                      # rope
+                        **ckpt_kwargs,
+                    )
             else:
-                hidden_states, initial_encoder_hidden_states = block(
+                hidden_states, initial_encoder_hidden_states, cond_hidden_states = block(
                     image_tokens = hidden_states,
                     image_tokens_masks = image_tokens_masks,
                     text_tokens = cur_encoder_hidden_states,
                     adaln_input = adaln_input,
                     rope = rope,
+                    cond_tokens=cond_hidden_states if use_condition else None,
+                    cond_adaln_input=cond_adaln_input if use_condition else None,
                 )
             initial_encoder_hidden_states = initial_encoder_hidden_states[:, :initial_encoder_hidden_states_seq_len]
             block_id += 1
