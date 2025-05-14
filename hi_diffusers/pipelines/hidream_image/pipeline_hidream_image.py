@@ -581,7 +581,7 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             latents_ids_to_concat.append(cond_latent_image_ids)
             
 
-        # Concatenate or return None
+        # Concatenate or return Non
         cond_latents = torch.cat(latents_to_concat, dim=0) if latents_to_concat else None
         cond_img_id = torch.cat(latents_ids_to_concat, dim=-2) if latents_ids_to_concat else None
         return latents, cond_latents, cond_img_id
