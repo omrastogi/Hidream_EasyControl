@@ -10,6 +10,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union, Any
 import numpy as np
 import pandas as pd
 import torch
+import math
 import transformers
 from einops import rearrange
 from loguru import logger
@@ -182,18 +183,35 @@ class StreamingImageCaptionInpaintDataset(StreamingDataset):
             prompt = ""
 
         img: Image.Image = sample[self.image_key]
-        original_width, original_height = img.size
+        width, height = img.size
 
-        closest_size, closest_ratio = self.get_closest_ratio(original_height, original_width, self.aspect_ratio)
+        # Scale image dimensions
+        vae_scale_factor = 2 ** (4 - 1)
+        default_sample_size, division = 128, vae_scale_factor * 2
+        S_max = (default_sample_size * vae_scale_factor) ** 2
+        scale = S_max / (width * height)
+        scale = math.sqrt(scale)
+        r_width, r_height = int(width * scale // division * division), int(height * scale // division * division)
+
+        image_transforms = T.Compose(
+            [
+                T.Lambda(lambda x: x.convert("RGB")),
+                T.Resize((1024, 1024), interpolation=T.InterpolationMode.BILINEAR),
+                T.ToTensor(),
+                T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
+
+        closest_size, closest_ratio = self.get_closest_ratio(height, width, self.aspect_ratio)
         closest_size = list(map(lambda x: int(x), closest_size))
 
-        data_info[self.output_keys.get("img_hw", "img_hw")] = torch.tensor([original_height, original_width], dtype=torch.float32)
+        data_info[self.output_keys.get("img_hw", "img_hw")] = torch.tensor([height, width], dtype=torch.float32)
         data_info[self.output_keys.get("aspect_ratio", "aspect_ratio")] = closest_ratio
 
-        if closest_size[0] / original_height > closest_size[1] / original_width:
-            resize_size = closest_size[0], int(original_width * closest_size[0] / original_height)
+        if closest_size[0] / height > closest_size[1] / width:
+            resize_size = closest_size[0], int(width * closest_size[0] / height)
         else:
-            resize_size = int(original_height * closest_size[1] / original_width), closest_size[1]
+            resize_size = int(height * closest_size[1] / width), closest_size[1]
 
         if self.center_crop:
             self.resize_transform = T.Compose(
@@ -233,8 +251,8 @@ class StreamingImageCaptionInpaintDataset(StreamingDataset):
         tensor_mask = torch.from_numpy(np_mask).contiguous()
         tensor_mask = rearrange(tensor_mask, "h w c -> c h w")
 
-        tensor_img = self.norm_transform(pil_img)
-        tensor_masked_img = self.norm_transform(masked_img)
+        tensor_img = image_transforms(pil_img)
+        tensor_masked_img = image_transforms(masked_img)
 
         data_info[self.output_keys.get("image", "image")] = tensor_img.contiguous()
         data_info[self.output_keys.get("prompt", "prompt")] = prompt
@@ -244,9 +262,7 @@ class StreamingImageCaptionInpaintDataset(StreamingDataset):
         data_info[self.output_keys.get("cond_pixel_values", "cond_pixel_values")] = cond_pixel_values.contiguous()
 
         return data_info
-        return data_info
-        return data_info
-        return data_info
+
 
     def __getitem__(self, index):
         """Alias for the `get` method."""
@@ -367,3 +383,5 @@ if __name__ == "__main__":
 
     # torch.save(batch, "test_dataloader_batch_size_4_num_workers_32_prefetch_factor_2_pin_memory_True.pt")
 # %%
+
+

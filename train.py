@@ -18,9 +18,8 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
-
+from hi_diffusers.models.attention_processor import HiDreamAttnProcessor_flashattn
 from tqdm.auto import tqdm
-# from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
 from transformers import AutoTokenizer, CLIPTokenizer, LlamaForCausalLM, PretrainedConfig, T5Tokenizer
 
 import diffusers
@@ -43,9 +42,6 @@ from diffusers.utils import (
     convert_unet_state_dict_to_peft
 )
 
-# TODO - then make adjustments as required 
-# from src.prompt_helper import *
-# from src.lora_helper import *
 from hi_diffusers.models.lora_helper import load_checkpoint
 from hi_diffusers.pipelines.hidream_image.pipeline_hidream_image import HiDreamImagePipeline
 from hi_diffusers.models.layers import MultiDoubleStreamBlockLoraProcessor, MultiSingleStreamBlockLoraProcessor
@@ -172,6 +168,12 @@ def parse_args(input_args=None):
         default=None,
         required=False,
         help="Path to pretrained model",
+    )
+    parser.add_argument(
+        "--with_prior_preservation",
+        default=False,
+        action="store_true",
+        help="Flag to add prior preservation loss.",
     )
     parser.add_argument(
         "--revision",
@@ -789,7 +791,7 @@ def main(args):
                     lora_attn_procs[name].proj_loras[n].up.weight.data = lora_state_dicts.get(f'{name}.proj_loras.{n}.up.weight', None)
             else:
                 # TODO - change this 
-                lora_attn_procs[name] = FluxAttnProcessor2_0()
+                lora_attn_procs[name] = HiDreamAttnProcessor_flashattn()
     else:
         lora_attn_procs = {}
         double_blocks_idx = list(range(16))
@@ -816,7 +818,10 @@ def main(args):
     for n, param in transformer.named_parameters():
         if '_lora' not in n:
             param.requires_grad = False
-    print(sum([p.numel() for p in transformer.parameters() if p.requires_grad]) / 1000000, 'M parameters')
+    trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+    frozen = sum(p.numel() for p in transformer.parameters() if not p.requires_grad)
+    print(f"Trainable params: {trainable/1e6:.3f}M | Frozen params: {frozen/1e6:.3f}M | Total: {(trainable+frozen)/1e6:.3f}M")
+
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -866,11 +871,14 @@ def main(args):
 
     clean_stale_shared_memory()
     # Create streams
-    STREAMS = make_streams(
-        remote=["/mnt/dashtoon_data/data_hub/gallery-dl/pinterest_mds_shards/aspect-ratio-0.6"],
-        local=tempfile.mkdtemp(prefix="streaming_cache_"),
-        choose=[10]
-    )
+    # STREAMS = make_streams(
+    #     local=["/mnt/dashtoon_data/data_hub/gallery-dl/pinterest_mds_shards/aspect-ratio-0.6"],
+    #     # local=tempfile.mkdtemp(prefix="streaming_cache_"),
+    #     choose=[10]
+    # )
+    mds_streams = []
+    for stream in ["/mnt/dashtoon_data/data_hub/gallery-dl/pinterest_mds_shards/aspect-ratio-0.6"]:
+        mds_streams.append(Stream(local=stream, proportion=None, repeat=None, choose=10))
 
     # Load caption metadata
     meta_path = "/mnt/dashtoon_data/data_hub/gallery-dl/pinterest_meta_caption_info_rewritten.jsonl"
@@ -878,7 +886,7 @@ def main(args):
 
     # Create dataset and dataloader
     train_dataset = StreamingImageCaptionInpaintDataset(
-        streams=STREAMS,
+        streams=mds_streams,
         item_key="__key__",
         image_key="image", 
         caption_key="caption",
@@ -1037,7 +1045,7 @@ def main(args):
     height_cond = 2 * (args.cond_size // vae_scale_factor)
     width_cond = 2 * (args.cond_size // vae_scale_factor)        
     offset = 64
-        
+    # NOTE -  42% gpu being used, when code is here
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
         for step, batch in enumerate(train_dataloader):
@@ -1071,6 +1079,7 @@ def main(args):
                 negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(accelerator.device)
 
                 pixel_values = batch["pixel_values"].to(device=vae.device, dtype=vae.dtype)
+                
                 height_ = 2 * (int(pixel_values.shape[-2]) // vae_scale_factor)
                 width_ = 2 * (int(pixel_values.shape[-1]) // vae_scale_factor)
 
@@ -1078,6 +1087,8 @@ def main(args):
                 model_input = (model_input - vae_config_shift_factor) * vae_config_scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
 
+                
+                # NOTE - 44% gpu 
                 # ! NOTE - Hidream doesn't need any img_ids, as it has a patchify function 
                 # latent_image_ids, cond_latent_image_ids = resize_position_encoding(
                 #     model_input.shape[0],
@@ -1110,6 +1121,36 @@ def main(args):
                 sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
 
+                # Handle non-square images
+                if noisy_model_input.shape[-2] != noisy_model_input.shape[-1]:
+                    B, C, H, W = noisy_model_input.shape
+                    max_seq, patch_size = accelerator.unwrap_model(model=transformer).max_seq, accelerator.unwrap_model(model=transformer).config.patch_size
+                    pH, pW = H // patch_size, W // patch_size
+
+                    img_sizes = torch.tensor([pH, pW], dtype=torch.int64).reshape(-1)
+                    img_ids = torch.zeros(pH, pW, 3)
+                    img_ids[..., 1] = img_ids[..., 1] + torch.arange(pH)[:, None]
+                    img_ids[..., 2] = img_ids[..., 2] + torch.arange(pW)[None, :]
+                    img_ids = img_ids.reshape(pH * pW, -1)
+
+                    img_ids_pad = torch.zeros(max_seq, 3)
+                    img_ids_pad[: pH * pW, :] = img_ids
+
+                    img_sizes = img_sizes.unsqueeze(0).to(noisy_model_input.device)
+                    img_ids = img_ids_pad.unsqueeze(0).to(noisy_model_input.device)
+                    img_sizes = img_sizes.repeat(B, 1)
+                    img_ids = img_ids.repeat(B, 1, 1)
+
+                    out = torch.zeros((B, C, max_seq, patch_size * patch_size), dtype=noisy_model_input.dtype, device=noisy_model_input.device)
+                    from einops import rearrange
+                    latent_model_input = rearrange(noisy_model_input, "b c (h p1) (w p2) -> b c (h w) (p1 p2)", p1=patch_size, p2=patch_size)
+                    out[:, :, 0 : pH * pW] = latent_model_input
+                    latent_model_input = out
+
+                else:
+                    img_sizes, img_ids = None, None
+                    latent_model_input = noisy_model_input
+
                 # ! NOTE: No packed latent required for HiDream
                 cond_image_ids_to_concat = []
                 latents_to_concat = []
@@ -1130,6 +1171,7 @@ def main(args):
                     sub_latent_image_ids[:, 1] += offset
                     sub_latent_image_ids = torch.concat([sub_latent_image_ids for _ in range(sub_number)], dim=-2)
                     cond_image_ids_to_concat.append(sub_latent_image_ids)
+                    del subject_pixel_values
                 
                 if args.spatial_column is not None:
                     # Dealing with the latents
@@ -1148,28 +1190,24 @@ def main(args):
                     cond_latent_image_ids = repeat(cond_latent_image_ids, "h w c -> b (h w) c", b=bsz)
                     cond_latent_image_ids = torch.concat([cond_latent_image_ids for _ in range(cond_number)], dim=-2)
                     cond_image_ids_to_concat.append(cond_latent_image_ids)
+                    del cond_pixel_values
 
                 cond_image_ids = torch.concat(cond_image_ids_to_concat, dim=-2)
                 cond_input = torch.cat(latents_to_concat, dim=0)
+                del pixel_values
 
-                # # handle guidance
-                # if accelerator.unwrap_model(transformer).config.guidance_embeds:
-                #     guidance = torch.tensor([args.guidance_scale], device=accelerator.device)
-                #     guidance = guidance.expand(model_input.shape[0])
-                # else:
-                #     guidance = None
 
                 # Predict the noise residual
                 model_pred = transformer(
-                    hidden_states=noisy_model_input,
+                    hidden_states=latent_model_input,
                     cond_hidden_states=cond_input,
                     cond_img_ids=cond_image_ids,
                     timesteps=timesteps,
                     encoder_hidden_states = prompt_embeds,
                     pooled_embeds = pooled_prompt_embeds,
                     # NOTE: Keeping the img_ids and img_size as None as the transformer model creates them
-                    img_ids=None,
-                    img_sizes=None,
+                    img_ids=img_ids,
+                    img_sizes=img_sizes,
                     return_dict=False,
                 )[0]
                 # Copied from https://github.com/huggingface/diffusers/blob/f4fa3beee7f49b80ce7a58f9c8002f43299175c9/examples/dreambooth/train_dreambooth_lora_hidream.py#L1613C17-L1613C45
@@ -1197,6 +1235,7 @@ def main(args):
                     prior_loss = prior_loss.mean()
 
                 # Compute regular loss.
+                print(weighting.shape, model_pred.shape, target.shape)
                 loss = torch.mean(
                     (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
                     1,
@@ -1246,7 +1285,7 @@ def main(args):
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         os.makedirs(save_path, exist_ok=True)
-                        unwrapped_model_state = accelerator.unwrap_model(transformer).state_dict()
+                        unwrapped_model_state = accelerator.unwrap_model(transformer).state_dict() # This will not work with (WAN lipsync in Miyagi)
                         lora_state_dict = {k:unwrapped_model_state[k] for k in unwrapped_model_state.keys() if '_lora' in k}
                         save_file(
                             lora_state_dict,
