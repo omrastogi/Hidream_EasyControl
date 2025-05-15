@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 from contextlib import nullcontext
+from einops import repeat
 from pathlib import Path
 import re
 from safetensors.torch import save_file
@@ -23,7 +24,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, CLIPTokenizer, LlamaForCausalLM, PretrainedConfig, T5Tokenizer
 
 import diffusers
-
+from diffusers.training_utils import free_memory
 from diffusers import (
     BitsAndBytesConfig,
     AutoencoderKL,
@@ -49,7 +50,7 @@ from hi_diffusers.models.lora_helper import load_checkpoint
 from hi_diffusers.pipelines.hidream_image.pipeline_hidream_image import HiDreamImagePipeline
 from hi_diffusers.models.layers import MultiDoubleStreamBlockLoraProcessor, MultiSingleStreamBlockLoraProcessor
 from hi_diffusers.models.transformers.transformer_hidream_image import HiDreamImageTransformer2DModel
-from dataset.dataset import StreamingImageCaptionInpaintDataset, custom_collate_fn
+from dataset.inpainting_dataset import StreamingImageCaptionInpaintDataset, custom_collate_fn
 
 if is_wandb_available():
     import wandb
@@ -260,20 +261,21 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--offload",
         action="store_true",
+        default=False,
         help="Whether to offload the VAE and the text encoder to CPU when they are not used.",
     )
     parser.add_argument(
         "--ranks",
         type=int,
         nargs="+",
-        default=[128],
+        default=[64],
         help=("The dimension of the LoRA update matrices."),
     )
     parser.add_argument(
         "--network_alphas",
         type=int,
         nargs="+",
-        default=[128],
+        default=[64],
         help=("The dimension of the LoRA update matrices."),
     )
     parser.add_argument(
@@ -498,6 +500,26 @@ def parse_args(input_args=None):
         args = parser.parse_args()
     return args
 
+def compute_text_embeddings(prompt, text_encoding_pipeline):
+    with torch.no_grad():
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+            pooled_prompt_embeds,
+            negative_pooled_prompt_embeds,
+        ) = text_encoding_pipeline.encode_prompt(
+            prompt=prompt,
+            prompt_2=prompt,
+            prompt_3=prompt,
+            prompt_4=prompt,
+            max_sequence_length=args.max_sequence_length)
+    return (
+        prompt_embeds,
+        negative_prompt_embeds,
+        pooled_prompt_embeds,
+        negative_pooled_prompt_embeds,
+    )
+
 def load_text_encoders(class_one, class_two, class_three):
     text_encoder_one = class_one.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant)
     text_encoder_two = class_two.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant)
@@ -509,6 +531,31 @@ def load_text_encoders(class_one, class_two, class_three):
         torch_dtype=torch.bfloat16,
     )
     return text_encoder_one, text_encoder_two, text_encoder_three, text_encoder_four
+
+def prepare_latent_image_ids_(height, width, device, dtype):
+    latent_image_ids = torch.zeros(height//2, width//2, 3, device=device, dtype=dtype)
+    latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height//2, device=device)[:, None]  # y
+    latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width//2, device=device)[None, :]   # x
+    return latent_image_ids
+
+def resize_position_encoding(batch_size, original_height, original_width, target_height, target_width, device, dtype):
+    latent_image_ids = prepare_latent_image_ids_(original_height, original_width, device, dtype)
+    latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
+    latent_image_ids = latent_image_ids.reshape(
+        latent_image_id_height * latent_image_id_width, latent_image_id_channels
+    )
+    
+    scale_h = original_height / target_height
+    scale_w = original_width / target_width
+    latent_image_ids_resized = torch.zeros(target_height//2, target_width//2, 3, device=device, dtype=dtype)
+    latent_image_ids_resized[..., 1] = latent_image_ids_resized[..., 1] + torch.arange(target_height//2, device=device)[:, None] * scale_h
+    latent_image_ids_resized[..., 2] = latent_image_ids_resized[..., 2] + torch.arange(target_width//2, device=device)[None, :] * scale_w
+    
+    cond_latent_image_id_height, cond_latent_image_id_width, cond_latent_image_id_channels = latent_image_ids_resized.shape
+    cond_latent_image_ids = latent_image_ids_resized.reshape(
+            cond_latent_image_id_height * cond_latent_image_id_width, cond_latent_image_id_channels
+        )
+    return latent_image_ids, cond_latent_image_ids 
 
 def main(args):
     if torch.backends.mps.is_available() and args.mixed_precision == "bf16":
@@ -658,6 +705,19 @@ def main(args):
     text_encoder_three.to(**to_kwargs)
     text_encoder_four.to(**to_kwargs)
 
+    text_encoding_pipeline = HiDreamImagePipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=None,
+        transformer=None,
+        text_encoder=text_encoder_one,
+        tokenizer=tokenizer_one,
+        text_encoder_2=text_encoder_two,
+        tokenizer_2=tokenizer_two,
+        text_encoder_3=text_encoder_three,
+        tokenizer_3=tokenizer_three,
+        text_encoder_4=text_encoder_four,
+        tokenizer_4=tokenizer_four,
+    )
     # we never offload the transformer to CPU, so we can just use the accelerator device
     transformer_to_kwargs = {"device": accelerator.device} if args.bnb_quantization_config_path is not None else {"device": accelerator.device, "dtype": weight_dtype}
     transformer.to(**transformer_to_kwargs)
@@ -669,26 +729,26 @@ def main(args):
         lora_path = args.pretrained_lora_path
         checkpoint = load_checkpoint(lora_path)
         lora_attn_procs = {}
-        double_blocks_idx = list(range(19))
-        single_blocks_idx = list(range(38))
+        double_blocks_idx = list(range(16))
+        single_blocks_idx = list(range(32))
         number = 1
         for name, attn_processor in transformer.attn_processors.items():
             match = re.search(r'\.(\d+)\.', name)
             if match:
                 layer_index = int(match.group(1))
             
-            if name.startswith("transformer_blocks") and layer_index in double_blocks_idx:
+            if name.startswith("double_stream_blocks") and layer_index in double_blocks_idx:
                 lora_state_dicts = {}
                 for key, value in checkpoint.items():
                     # Match based on the layer index in the key (assuming the key contains layer index)
                     if re.search(r'\.(\d+)\.', key):
                         checkpoint_layer_index = int(re.search(r'\.(\d+)\.', key).group(1))
-                        if checkpoint_layer_index == layer_index and key.startswith("transformer_blocks"):
+                        if checkpoint_layer_index == layer_index and key.startswith("double_stream_blocks"):
                             lora_state_dicts[key] = value
                 
                 print("setting LoRA Processor for", name)
                 lora_attn_procs[name] = MultiDoubleStreamBlockLoraProcessor(
-                    dim=3072, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
+                    dim=2560, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
                 )
                 
                 # Load the weights from the checkpoint dictionary into the corresponding layers
@@ -702,19 +762,19 @@ def main(args):
                     lora_attn_procs[name].proj_loras[n].down.weight.data = lora_state_dicts.get(f'{name}.proj_loras.{n}.down.weight', None)
                     lora_attn_procs[name].proj_loras[n].up.weight.data = lora_state_dicts.get(f'{name}.proj_loras.{n}.up.weight', None)
                 
-            elif name.startswith("single_transformer_blocks") and layer_index in single_blocks_idx:
+            elif name.startswith("single_stream_blocks") and layer_index in single_blocks_idx:
                 
                 lora_state_dicts = {}
                 for key, value in checkpoint.items():
                     # Match based on the layer index in the key (assuming the key contains layer index)
                     if re.search(r'\.(\d+)\.', key):
                         checkpoint_layer_index = int(re.search(r'\.(\d+)\.', key).group(1))
-                        if checkpoint_layer_index == layer_index and key.startswith("single_transformer_blocks"):
+                        if checkpoint_layer_index == layer_index and key.startswith("single_stream_blocks"):
                             lora_state_dicts[key] = value
                 
                 print("setting LoRA Processor for", name)        
                 lora_attn_procs[name] = MultiSingleStreamBlockLoraProcessor(
-                    dim=3072, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
+                    dim=2560, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
                 )
                 
                 # Load the weights from the checkpoint dictionary into the corresponding layers
@@ -725,25 +785,28 @@ def main(args):
                     lora_attn_procs[name].k_loras[n].up.weight.data = lora_state_dicts.get(f'{name}.k_loras.{n}.up.weight', None)
                     lora_attn_procs[name].v_loras[n].down.weight.data = lora_state_dicts.get(f'{name}.v_loras.{n}.down.weight', None)
                     lora_attn_procs[name].v_loras[n].up.weight.data = lora_state_dicts.get(f'{name}.v_loras.{n}.up.weight', None)
+                    lora_attn_procs[name].proj_loras[n].down.weight.data = lora_state_dicts.get(f'{name}.proj_loras.{n}.down.weight', None)
+                    lora_attn_procs[name].proj_loras[n].up.weight.data = lora_state_dicts.get(f'{name}.proj_loras.{n}.up.weight', None)
             else:
+                # TODO - change this 
                 lora_attn_procs[name] = FluxAttnProcessor2_0()
     else:
         lora_attn_procs = {}
-        double_blocks_idx = list(range(19))
-        single_blocks_idx = list(range(38))
+        double_blocks_idx = list(range(16))
+        single_blocks_idx = list(range(32))
         for name, attn_processor in transformer.attn_processors.items():
             match = re.search(r'\.(\d+)\.', name)
             if match:
                 layer_index = int(match.group(1))
-            if name.startswith("transformer_blocks") and layer_index in double_blocks_idx:
+            if name.startswith("double_stream_blocks") and layer_index in double_blocks_idx:
                 print("setting LoRA Processor for", name)
                 lora_attn_procs[name] = MultiDoubleStreamBlockLoraProcessor(
-                    dim=3072, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
+                    dim=2560, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
                 )
-            elif name.startswith("single_transformer_blocks") and layer_index in single_blocks_idx:
+            elif name.startswith("single_stream_blocks") and layer_index in single_blocks_idx:
                 print("setting LoRA Processor for", name)
                 lora_attn_procs[name] = MultiSingleStreamBlockLoraProcessor(
-                    dim=3072, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
+                    dim=2560, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
                 )
             else:
                 lora_attn_procs[name] = attn_processor        
@@ -797,12 +860,16 @@ def main(args):
     # Dataset and DataLoader 
     from streaming import Stream, StreamingDataLoader
     from dataset.streaming_utils import make_streams
+    from streaming.base.util import clean_stale_shared_memory
     import pandas as pd 
+    import tempfile
 
+    clean_stale_shared_memory()
     # Create streams
     STREAMS = make_streams(
         remote=["/mnt/dashtoon_data/data_hub/gallery-dl/pinterest_mds_shards/aspect-ratio-0.6"],
-        choose=[50]
+        local=tempfile.mkdtemp(prefix="streaming_cache_"),
+        choose=[10]
     )
 
     # Load caption metadata
@@ -828,23 +895,12 @@ def main(args):
     )
 
     train_dataloader = StreamingDataLoader(
-        dataset,
-        batch_size=4,
+        train_dataset,
+        batch_size=args.train_batch_size,
         num_workers=32,
         prefetch_factor=2,
         pin_memory=True,
-        collate_fn=custom_collate_fn
-    )
-
-
-    # Dataset and DataLoaders creation:
-    train_dataset = make_train_dataset(args, tokenizers, accelerator)
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=args.dataloader_num_workers,
+        # collate_fn=custom_collate_fn
     )
 
     vae_config_shift_factor = vae.config.shift_factor
@@ -868,16 +924,76 @@ def main(args):
         power=args.lr_power,
     )
 
-    transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        transformer, optimizer, train_dataloader, lr_scheduler
-    )
+    # Prepare everything with our `accelerator`.
+    # ! NOTE:
+    # ! We do not pass `train_dataloader` to `accelerator.prepare` because it is a StreamingDataLoader and we get the following error:
+    # ! RuntimeError: You can't use batches of different size with `dispatch_batches=True` or when using an `IterableDataset`.either pass `dispatch_batches=False` and
+    # ! have each process fetch its own batch  or pass `split_batches=True`. By doing so, the main process will fetch a full batch and slice it into `num_processes`
+    # ! batches for each process.
+    transformer, optimizer, lr_scheduler = accelerator.prepare(transformer, optimizer, lr_scheduler)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
+
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    precompute_latents = args.cache_latents
+    if precompute_latents:
+        prompt_embeds_cache = []
+        negative_prompt_embeds_cache = []
+        pooled_prompt_embeds_cache = []
+        negative_pooled_prompt_embeds_cache = []
+        latents_cache = []
+        # if args.offload:
+        #     vae = vae.to(accelerator.device)
+        for batch in tqdm(train_dataloader, desc="Caching latents"):
+            with torch.no_grad():
+                text_encoding_pipeline = text_encoding_pipeline.to(accelerator.device)
+                prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = compute_text_embeddings(batch["prompt"], text_encoding_pipeline)
+                # Handle prompt_embeds which can be a list of tensors or a single tensor
+                if isinstance(prompt_embeds, list):
+                    prompt_embeds = [p.to("cpu") for p in prompt_embeds]
+                else:
+                    prompt_embeds = prompt_embeds.to("cpu")
+
+                # Handle negative_prompt_embeds which can be a list of tensors or a single tensor  
+                if isinstance(negative_prompt_embeds, list):
+                    negative_prompt_embeds = [n.to("cpu") for n in negative_prompt_embeds]
+                else:
+                    negative_prompt_embeds = negative_prompt_embeds.to("cpu")
+
+                # Handle pooled_prompt_embeds which is a single tensor
+                pooled_prompt_embeds = pooled_prompt_embeds.to("cpu")
+
+                # Handle negative_pooled_prompt_embeds which is a single tensor
+                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to("cpu")
+
+                prompt_embeds_cache.append(prompt_embeds)
+                negative_prompt_embeds_cache.append(negative_prompt_embeds) 
+                pooled_prompt_embeds_cache.append(pooled_prompt_embeds)
+                negative_pooled_prompt_embeds_cache.append(negative_pooled_prompt_embeds)
+
+    ## Not touching the VAE
+    # move back to cpu before deleting to ensure memory is freed see: https://github.com/huggingface/diffusers/issues/11376#issue-3008144624
+    # if args.offload or args.cache_latents:
+    #     vae = vae.to("cpu")
+    #     if args.cache_latents:
+    #         del vae
+    # move back to cpu before deleting to ensure memory is freed see: https://github.com/huggingface/diffusers/issues/11376#issue-3008144624
+    text_encoding_pipeline = text_encoding_pipeline.to("cpu")
+    del (
+        text_encoder_one,
+        text_encoder_two,
+        text_encoder_three,
+        text_encoder_four,
+        tokenizer_two,
+        tokenizer_three,
+        tokenizer_four,
+        text_encoding_pipeline,
+    )
+    free_memory()
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -926,15 +1042,35 @@ def main(args):
         transformer.train()
         for step, batch in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
-            with accelerator.accumulate(models_to_accumulate):
-                
-                tokens = [batch["text_ids_1"], batch["text_ids_2"]]
-                prompt_embeds, pooled_prompt_embeds, text_ids = encode_token_ids(text_encoders, tokens, accelerator)
-                prompt_embeds = prompt_embeds.to(dtype=vae.dtype, device=accelerator.device)
-                pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=vae.dtype, device=accelerator.device)
-                text_ids = text_ids.to(dtype=vae.dtype, device=accelerator.device)
-                
-                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
+
+            with accelerator.accumulate(models_to_accumulate):    
+                # NOTE - Text id not required 
+                # TODO - understand this and add the cache unloading - DONE 
+                prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = (
+                    prompt_embeds_cache[step],
+                    negative_prompt_embeds_cache[step], 
+                    pooled_prompt_embeds_cache[step],
+                    negative_pooled_prompt_embeds_cache[step]
+                )
+                # Handle prompt_embeds which can be a list of tensors or a single tensor
+                if isinstance(prompt_embeds, list):
+                    prompt_embeds = [p.to(accelerator.device) for p in prompt_embeds]
+                else:
+                    prompt_embeds = prompt_embeds.to(accelerator.device)
+
+                # Handle negative_prompt_embeds which can be a list of tensors or a single tensor  
+                if isinstance(negative_prompt_embeds, list):
+                    negative_prompt_embeds = [n.to(accelerator.device) for n in negative_prompt_embeds]
+                else:
+                    negative_prompt_embeds = negative_prompt_embeds.to(accelerator.device)
+
+                # Handle pooled_prompt_embeds which is a single tensor
+                pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
+
+                # Handle negative_pooled_prompt_embeds which is a single tensor
+                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(accelerator.device)
+
+                pixel_values = batch["pixel_values"].to(device=vae.device, dtype=vae.dtype)
                 height_ = 2 * (int(pixel_values.shape[-2]) // vae_scale_factor)
                 width_ = 2 * (int(pixel_values.shape[-1]) // vae_scale_factor)
 
@@ -942,15 +1078,16 @@ def main(args):
                 model_input = (model_input - vae_config_shift_factor) * vae_config_scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
 
-                latent_image_ids, cond_latent_image_ids = resize_position_encoding(
-                    model_input.shape[0],
-                    height_,
-                    width_,
-                    height_cond,
-                    width_cond,
-                    accelerator.device,
-                    weight_dtype,
-                )
+                # ! NOTE - Hidream doesn't need any img_ids, as it has a patchify function 
+                # latent_image_ids, cond_latent_image_ids = resize_position_encoding(
+                #     model_input.shape[0],
+                #     height_,
+                #     width_,
+                #     height_cond,
+                #     width_cond,
+                #     accelerator.device,
+                #     weight_dtype,
+                # )
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
@@ -973,85 +1110,70 @@ def main(args):
                 sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
 
-                packed_noisy_model_input = FluxPipeline._pack_latents(
-                    noisy_model_input,
-                    batch_size=model_input.shape[0],
-                    num_channels_latents=model_input.shape[1],
-                    height=model_input.shape[2],
-                    width=model_input.shape[3],
-                )
-                
-                latent_image_ids_to_concat = [latent_image_ids]
-                packed_cond_model_input_to_concat = []
+                # ! NOTE: No packed latent required for HiDream
+                cond_image_ids_to_concat = []
+                latents_to_concat = []
                 
                 if args.subject_column is not None:
+                    # Dealing with the latents
                     subject_pixel_values = batch["subject_pixel_values"].to(dtype=vae.dtype)
                     subject_input = vae.encode(subject_pixel_values).latent_dist.sample()
                     subject_input = (subject_input - vae_config_shift_factor) * vae_config_scaling_factor
-                    subject_input = subject_input.to(dtype=weight_dtype)             
+                    subject_input = subject_input.to(dtype=weight_dtype)
+                    latents_to_concat.append(subject_input.unsqueeze(0))
+                    # Dealing with the img_ids for subject
                     sub_number = subject_pixel_values.shape[-2] // args.cond_size
-                    latent_subject_ids = prepare_latent_subject_ids(height_cond, width_cond, accelerator.device, weight_dtype)
-                    latent_subject_ids[:, 1] += offset
-                    sub_latent_image_ids = torch.concat([latent_subject_ids for _ in range(sub_number)], dim=-2)
-                    latent_image_ids_to_concat.append(sub_latent_image_ids)
-                    
-                    packed_subject_model_input = FluxPipeline._pack_latents(    
-                        subject_input,
-                        batch_size=subject_input.shape[0],
-                        num_channels_latents=subject_input.shape[1],
-                        height=subject_input.shape[2],
-                        width=subject_input.shape[3],
-                    )
-                    packed_cond_model_input_to_concat.append(packed_subject_model_input)
+                    sub_latent_image_ids = torch.zeros(height_cond // 2, width_cond // 2, 3, device=model_input.device, dtype=weight_dtype)
+                    sub_latent_image_ids[..., 1] = sub_latent_image_ids[..., 1] + torch.arange(height_cond // 2, device=model_input.device)[:, None]
+                    sub_latent_image_ids[..., 2] = sub_latent_image_ids[..., 2] + torch.arange(width_cond // 2, device=model_input.device)[None, :]
+                    sub_latent_image_ids = repeat(sub_latent_image_ids, "h w c -> b (h w) c", b=bsz)
+                    sub_latent_image_ids[:, 1] += offset
+                    sub_latent_image_ids = torch.concat([sub_latent_image_ids for _ in range(sub_number)], dim=-2)
+                    cond_image_ids_to_concat.append(sub_latent_image_ids)
                 
                 if args.spatial_column is not None:
-                    cond_pixel_values = batch["cond_pixel_values"].to(dtype=vae.dtype)             
+                    # Dealing with the latents
+                    cond_pixel_values = batch["cond_pixel_values"].to(device=vae.device, dtype=vae.dtype)             
                     cond_input = vae.encode(cond_pixel_values).latent_dist.sample()
                     cond_input = (cond_input - vae_config_shift_factor) * vae_config_scaling_factor
                     cond_input = cond_input.to(dtype=weight_dtype)
+                    latents_to_concat.append(cond_input.unsqueeze(0))
+                    # Dealing with the img_ids for cond
                     cond_number = cond_pixel_values.shape[-2] // args.cond_size
+                    scale_h = height_ / height_cond
+                    scale_w = width_ / width_cond
+                    cond_latent_image_ids = torch.zeros(height_cond // 2, width_cond // 2, 3, device=model_input.device, dtype=weight_dtype)
+                    cond_latent_image_ids[..., 1] = cond_latent_image_ids[..., 1] + torch.arange(height_cond // 2, device=model_input.device)[:, None] * scale_h
+                    cond_latent_image_ids[..., 2] = cond_latent_image_ids[..., 2] + torch.arange(width_cond // 2, device=model_input.device)[None, :] * scale_w
+                    cond_latent_image_ids = repeat(cond_latent_image_ids, "h w c -> b (h w) c", b=bsz)
                     cond_latent_image_ids = torch.concat([cond_latent_image_ids for _ in range(cond_number)], dim=-2)
-                    latent_image_ids_to_concat.append(cond_latent_image_ids)
+                    cond_image_ids_to_concat.append(cond_latent_image_ids)
 
-                    packed_cond_model_input = FluxPipeline._pack_latents(
-                        cond_input,
-                        batch_size=cond_input.shape[0],
-                        num_channels_latents=cond_input.shape[1],
-                        height=cond_input.shape[2],
-                        width=cond_input.shape[3],
-                    )
-                    packed_cond_model_input_to_concat.append(packed_cond_model_input)
-                    
-                latent_image_ids = torch.concat(latent_image_ids_to_concat, dim=-2)
-                cond_packed_noisy_model_input = torch.concat(packed_cond_model_input_to_concat, dim=-2)
+                cond_image_ids = torch.concat(cond_image_ids_to_concat, dim=-2)
+                cond_input = torch.cat(latents_to_concat, dim=0)
 
-                # handle guidance
-                if accelerator.unwrap_model(transformer).config.guidance_embeds:
-                    guidance = torch.tensor([args.guidance_scale], device=accelerator.device)
-                    guidance = guidance.expand(model_input.shape[0])
-                else:
-                    guidance = None
+                # # handle guidance
+                # if accelerator.unwrap_model(transformer).config.guidance_embeds:
+                #     guidance = torch.tensor([args.guidance_scale], device=accelerator.device)
+                #     guidance = guidance.expand(model_input.shape[0])
+                # else:
+                #     guidance = None
 
                 # Predict the noise residual
                 model_pred = transformer(
-                    hidden_states=packed_noisy_model_input,
-                    # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
-                    cond_hidden_states=cond_packed_noisy_model_input,
-                    timestep=timesteps / 1000,
-                    guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
-                    encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,
-                    img_ids=latent_image_ids,
+                    hidden_states=noisy_model_input,
+                    cond_hidden_states=cond_input,
+                    cond_img_ids=cond_image_ids,
+                    timesteps=timesteps,
+                    encoder_hidden_states = prompt_embeds,
+                    pooled_embeds = pooled_prompt_embeds,
+                    # NOTE: Keeping the img_ids and img_size as None as the transformer model creates them
+                    img_ids=None,
+                    img_sizes=None,
                     return_dict=False,
                 )[0]
-                
-                model_pred = FluxPipeline._unpack_latents(
-                    model_pred,
-                    height=int(pixel_values.shape[-2]),
-                    width=int(pixel_values.shape[-1]),
-                    vae_scale_factor=vae_scale_factor,
-                )
+                # Copied from https://github.com/huggingface/diffusers/blob/f4fa3beee7f49b80ce7a58f9c8002f43299175c9/examples/dreambooth/train_dreambooth_lora_hidream.py#L1613C17-L1613C45
+                model_pred = model_pred * -1
 
                 # these weighting schemes use a uniform timestep sampling
                 # and instead post-weight the loss
@@ -1060,6 +1182,20 @@ def main(args):
                 # flow matching loss
                 target = noise - model_input
 
+                if args.with_prior_preservation:
+                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                    target, target_prior = torch.chunk(target, 2, dim=0)
+
+                    # Compute prior loss
+                    prior_loss = torch.mean(
+                        (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2).reshape(
+                            target_prior.shape[0], -1
+                        ),
+                        1,
+                    )
+                    prior_loss = prior_loss.mean()
+
                 # Compute regular loss.
                 loss = torch.mean(
                     (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
@@ -1067,6 +1203,11 @@ def main(args):
                 )
 
                 loss = loss.mean()
+
+                if args.with_prior_preservation:
+                    # Add the prior loss to the instance loss.
+                    loss = loss + args.prior_loss_weight * prior_loss
+
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = (transformer.parameters())

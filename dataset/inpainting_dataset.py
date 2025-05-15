@@ -55,6 +55,7 @@ class StreamingImageCaptionInpaintDataset(StreamingDataset):
         irregular_mask_prob: float = 1.0,
         box_mask_prob: float = 1.0,
         switch_to_dumb_mask_prob: float = 0.25,
+        cond_size: int = 512,
         output_keys: Dict[str, str] = {"image": "pixel_values", "mask": "mask_values", "prompt": "prompt", "img_hw": "img_hw", "aspect_ratio": "aspect_ratio"},
         **streaming_kwargs,
     ):
@@ -87,6 +88,7 @@ class StreamingImageCaptionInpaintDataset(StreamingDataset):
                 Defaults to 1.0.
             switch_to_dumb_mask_prob (float, optional): Probability to switch to a simple
                 ("dumb") mask generator. Defaults to 0.25.
+            cond_size (int, optional): Size of the conditioning image. Defaults to 64.
             output_keys (Dict[str, str], optional): Mapping for output dictionary keys.
                 Defaults to a predefined mapping.
             **streaming_kwargs: Additional arguments for `StreamingDataset`.
@@ -121,6 +123,13 @@ class StreamingImageCaptionInpaintDataset(StreamingDataset):
                 T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ]
         )
+        # Define conditioning transforms in __init__ since they're constant
+        self.cond_train_transforms = T.Compose([
+            T.Resize((cond_size, cond_size), interpolation=T.InterpolationMode.BILINEAR),
+            T.CenterCrop((cond_size, cond_size)), 
+            T.ToTensor(),
+            T.Normalize([0.5], [0.5])
+        ])
 
     @staticmethod
     def get_closest_ratio(height: float, width: float, ratios: dict):
@@ -230,8 +239,13 @@ class StreamingImageCaptionInpaintDataset(StreamingDataset):
         data_info[self.output_keys.get("image", "image")] = tensor_img.contiguous()
         data_info[self.output_keys.get("prompt", "prompt")] = prompt
         data_info[self.output_keys.get("mask", "mask")] = tensor_mask.contiguous()
-        data_info[self.output_keys.get("masked_image", "masked_image")] = tensor_masked_img.contiguous()
+        # Apply conditioning transforms to masked image
+        cond_pixel_values = self.cond_train_transforms(masked_img)
+        data_info[self.output_keys.get("cond_pixel_values", "cond_pixel_values")] = cond_pixel_values.contiguous()
 
+        return data_info
+        return data_info
+        return data_info
         return data_info
 
     def __getitem__(self, index):
@@ -247,15 +261,18 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "aspect_ratio":    torch.tensor([sample["aspect_ratio"]    for sample in batch], dtype=torch.float32),  # (B,)
         "pixel_values":    torch.stack([sample["pixel_values"]    for sample in batch], dim=0),  # (B, 3, H, W)
         "mask_values":     torch.stack([sample["mask_values"]     for sample in batch], dim=0),  # (B, 1, H, W)
-        "masked_image":    torch.stack([sample["masked_image"]    for sample in batch], dim=0),  # (B, 3, H, W)
-        "prompt":          [   sample["prompt"]                    for sample in batch],         # List[str] of length B
+        "masked_image":    torch.stack([sample["cond_pixel_values"]    for sample in batch], dim=0),  # (B, 3, H, W)
+        "prompt":       [sample["prompt"]                   for sample in batch],         # List[str] of length B
     }
 
 
 # %%
 if __name__ == "__main__":
     from streaming import Stream, StreamingDataLoader
+    from streaming.base.util import clean_stale_shared_memory
+    import tempfile
 
+    clean_stale_shared_memory()
     # Create streams
     STREAMS = make_streams(
         remote=[
@@ -264,6 +281,7 @@ if __name__ == "__main__":
             # "/mnt/dashtoon_data/data_hub/gallery-dl/pinterest_mds_shards/aspect-ratio-0.57",
             # "/mnt/dashtoon_data/data_hub/gallery-dl/pinterest_mds_shards/aspect-ratio-0.68",
         ],
+        local=tempfile.mkdtemp(prefix="streaming_cache_"),
         choose=[50],
     )
     print(STREAMS)
@@ -294,7 +312,14 @@ if __name__ == "__main__":
         switch_to_dumb_mask_prob=0.25,
         **streaming_kwargs,
     )
-    dataloader = StreamingDataLoader(dataset, batch_size=4, num_workers=32, prefetch_factor=2, pin_memory=True, collate_fn=custom_collate_fn)
+    dataloader = StreamingDataLoader(
+        dataset, 
+        batch_size=4, 
+        num_workers=32, 
+        prefetch_factor=2, 
+        pin_memory=True, 
+        # collate_fn=custom_collate_fn
+        )
 
     # Print dataset info
     print(f"Dataset size: {len(dataset)}")
@@ -303,6 +328,11 @@ if __name__ == "__main__":
     print(f"Batch size: {dataloader.batch_size}")
     print(f"Number of workers: {dataloader.num_workers}")
     print("\nSample batch contents:")
+    
+    # import tqdm
+    # for batch in tqdm(dataloader, desc="Caching latents"):
+    #     print(batch)
+    #     break 
 
     # Iterate through batches and save sample images
     for batch_idx, batch in enumerate(dataloader):
@@ -324,13 +354,13 @@ if __name__ == "__main__":
                         mask = (mask * 255).astype(np.uint8)
                         mask = Image.fromarray(mask)
                         mask.save(f"mask_values_batch{batch_idx}_sample{i}.png")
-                elif k == "masked_image":
+                elif k == "cond_pixel_values":
                     # Convert masked image tensor to images and save
                     for i in range(v.shape[0]):
                         img = v[i].permute(1, 2, 0).cpu().numpy()
                         img = (img * 255).astype(np.uint8)
                         img = Image.fromarray(img)
-                        img.save(f"masked_image_batch{batch_idx}_sample{i}.png")
+                        img.save(f"cond_pixel_values{batch_idx}_sample{i}.png")
             else:
                 print(f"{k}: {v}")
         break
