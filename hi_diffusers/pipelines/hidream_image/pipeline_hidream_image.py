@@ -802,8 +802,9 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             subject_image_latents = self._encode_vae_image(image=subject_image, generator=generator)
             latents_to_concat.append(subject_image_latents.unsqueeze(0))
             latent_image_ids = torch.zeros(height_cond // 2, width_cond // 2, 3, device=device, dtype=dtype)
-            latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height_cond // 2, device=device)[:, None] + 64 # fixed offset
+            latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height_cond // 2, device=device)[:, None] 
             latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width_cond // 2, device=device)[None, :]
+            latent_image_ids[:,1] += + 64 # fixed offset
             latent_image_ids = repeat(latent_image_ids, "h w c -> b (h w) c", b=batch_size)
             subject_latent_image_ids = torch.concat([latent_image_ids for _ in range(sub_number)], dim=-2)
             latents_ids_to_concat.append(subject_latent_image_ids)

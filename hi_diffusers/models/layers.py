@@ -285,7 +285,7 @@ class MultiDoubleStreamBlockLoraProcessor(nn.Module):
         
         # Create attention mask for conditional blocks
         num_cond_blocks = self.n_loras
-        mask = torch.ones((scaled_seq_len, scaled_seq_len), device=image_tokens.device)
+        mask = torch.ones((scaled_seq_len, scaled_seq_len), device=image_tokens.device, dtype=image_tokens.dtype)
         mask[ :scaled_block_size, :] = 0  # First block_size row
         for i in range(num_cond_blocks):
             start = i * scaled_cond_size + scaled_block_size

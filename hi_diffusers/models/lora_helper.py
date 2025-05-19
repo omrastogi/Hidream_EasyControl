@@ -28,6 +28,7 @@ def load_checkpoint(local_path):
             checkpoint = torch.load(local_path, map_location='cpu')
     return checkpoint
 
+# TODO - make changes to this 
 def update_model_with_lora(checkpoint, lora_weights, transformer, cond_size):
         number = len(lora_weights)
         ranks = [get_lora_rank(checkpoint) for _ in range(number)]

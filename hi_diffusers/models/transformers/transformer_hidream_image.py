@@ -377,9 +377,15 @@ class HiDreamImageTransformer2DModel(
         timesteps = timesteps.expand(batch_size)
         return timesteps
 
-    def unpatchify(self, x: torch.Tensor, img_sizes: List[Tuple[int, int]], is_training: bool) -> List[torch.Tensor]:            
+    def unpatchify(self, x: torch.Tensor, img_sizes: List[Tuple[int, int]], is_training: bool) -> List[torch.Tensor]:   
+        is_training = False         
         if is_training:
-            x = einops.rearrange(x, 'B S (p1 p2 C) -> B C S (p1 p2)', p1=self.config.patch_size, p2=self.config.patch_size)
+            # x = einops.rearrange(x, 'B S (p1 p2 C) -> B C S (p1 p2)', p1=self.config.patch_size, p2=self.config.patch_size)
+            B, S, F = x.shape
+            C = F // (self.config.patch_size * self.config.patch_size)
+            x = x.reshape(B, S, self.config.patch_size, self.config.patch_size, C).permute(0, 4, 1, 2, 3).reshape(B, C, S, self.config.patch_size * self.config.patch_size)
+            print(B, S, F)
+            print(x.shape)
         else:
             x_arr = []
             for i, img_size in enumerate(img_sizes):
@@ -540,7 +546,8 @@ class HiDreamImageTransformer2DModel(
             cond_hidden_states = torch.concat(latents_to_concat, dim=-2)
             cond_hidden_states = self.x_embedder(cond_hidden_states)
             img_ids = torch.concat([img_ids, cond_img_ids], dim=-2)
-
+        
+        img_ids = img_ids.to(dtype=hidden_states.dtype)
 
         T5_encoder_hidden_states = encoder_hidden_states[0]
         encoder_hidden_states = encoder_hidden_states[-1]
@@ -564,7 +571,7 @@ class HiDreamImageTransformer2DModel(
             device=img_ids.device, dtype=img_ids.dtype
         )
         ids = torch.cat((img_ids, txt_ids), dim=1)
-        rope = self.pe_embedder(ids)
+        rope = self.pe_embedder(ids).to(dtype=hidden_states.dtype)
 
         # 2. Blocks
         block_id = 0
