@@ -270,14 +270,14 @@ def parse_args(input_args=None):
         "--ranks",
         type=int,
         nargs="+",
-        default=[64],
+        default=[4],
         help=("The dimension of the LoRA update matrices."),
     )
     parser.add_argument(
         "--network_alphas",
         type=int,
         nargs="+",
-        default=[64],
+        default=[4],
         help=("The dimension of the LoRA update matrices."),
     )
     parser.add_argument(
@@ -748,7 +748,7 @@ def main(args):
                         if checkpoint_layer_index == layer_index and key.startswith("double_stream_blocks"):
                             lora_state_dicts[key] = value
                 
-                print("setting LoRA Processor for", name)
+                # print("setting LoRA Processor for", name)
                 lora_attn_procs[name] = MultiDoubleStreamBlockLoraProcessor(
                     dim=2560, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
                 )
@@ -774,7 +774,7 @@ def main(args):
                         if checkpoint_layer_index == layer_index and key.startswith("single_stream_blocks"):
                             lora_state_dicts[key] = value
                 
-                print("setting LoRA Processor for", name)        
+                # print("setting LoRA Processor for", name)        
                 lora_attn_procs[name] = MultiSingleStreamBlockLoraProcessor(
                     dim=2560, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
                 )
@@ -1050,6 +1050,7 @@ def main(args):
     height_cond = 2 * (args.cond_size // vae_scale_factor)
     width_cond = 2 * (args.cond_size // vae_scale_factor)        
     offset = 64
+    print(accelerator.gradient_accumulation_steps)
     # NOTE -  42% gpu being used, when code is here
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
