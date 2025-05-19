@@ -17,11 +17,11 @@ import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, DistributedType, FullyShardedDataParallelPlugin, InitProcessGroupKwargs, ProjectConfiguration, set_seed
 from hi_diffusers.models.attention_processor import HiDreamAttnProcessor_flashattn
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, CLIPTokenizer, LlamaForCausalLM, PretrainedConfig, T5Tokenizer
-
+import gc
 import diffusers
 from diffusers.training_utils import free_memory
 from diffusers import (
@@ -804,20 +804,24 @@ def main(args):
                 print("setting LoRA Processor for", name)
                 lora_attn_procs[name] = MultiDoubleStreamBlockLoraProcessor(
                     dim=2560, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
-                )
+                ).to(device=accelerator.device)
             elif name.startswith("single_stream_blocks") and layer_index in single_blocks_idx:
                 print("setting LoRA Processor for", name)
                 lora_attn_procs[name] = MultiSingleStreamBlockLoraProcessor(
                     dim=2560, ranks=args.ranks, network_alphas=args.network_alphas, lora_weights=[1 for _ in range(args.lora_num)], device=accelerator.device, dtype=weight_dtype, cond_width=args.cond_size, cond_height=args.cond_size, n_loras=args.lora_num
-                )
+                ).to(device=accelerator.device)
             else:
                 lora_attn_procs[name] = attn_processor        
     ######################
+    # Count if somehting is on CPU in lora_attn
     transformer.set_attn_processor(lora_attn_procs)
+    
     transformer.train()
+
     for n, param in transformer.named_parameters():
         if '_lora' not in n:
             param.requires_grad = False
+
     trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
     frozen = sum(p.numel() for p in transformer.parameters() if not p.requires_grad)
     print(f"Trainable params: {trainable/1e6:.3f}M | Frozen params: {frozen/1e6:.3f}M | Total: {(trainable+frozen)/1e6:.3f}M")
@@ -1030,7 +1034,8 @@ def main(args):
     )
 
     def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
-        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
+        print(timesteps)
+        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype) 
         schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
         timesteps = timesteps.to(accelerator.device)
         step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
@@ -1078,7 +1083,9 @@ def main(args):
                 # Handle negative_pooled_prompt_embeds which is a single tensor
                 negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(accelerator.device)
 
-                pixel_values = batch["pixel_values"].to(device=vae.device, dtype=vae.dtype)
+                # Move vae to accelerator device for encoding
+                vae = vae.to(accelerator.device)
+                pixel_values = batch["pixel_values"].to(device=accelerator.device, dtype=weight_dtype)
                 
                 height_ = 2 * (int(pixel_values.shape[-2]) // vae_scale_factor)
                 width_ = 2 * (int(pixel_values.shape[-1]) // vae_scale_factor)
@@ -1087,19 +1094,8 @@ def main(args):
                 model_input = (model_input - vae_config_shift_factor) * vae_config_scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
 
-                
                 # NOTE - 44% gpu 
                 # ! NOTE - Hidream doesn't need any img_ids, as it has a patchify function 
-                # latent_image_ids, cond_latent_image_ids = resize_position_encoding(
-                #     model_input.shape[0],
-                #     height_,
-                #     width_,
-                #     height_cond,
-                #     width_cond,
-                #     accelerator.device,
-                #     weight_dtype,
-                # )
-
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
                 bsz = model_input.shape[0]
@@ -1114,7 +1110,7 @@ def main(args):
                     mode_scale=args.mode_scale,
                 )
                 indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
-                timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
+                timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device, dtype=model_input.dtype)
 
                 # Add noise according to flow matching.
                 # zt = (1 - texp) * x + texp * z1
@@ -1157,7 +1153,7 @@ def main(args):
                 
                 if args.subject_column is not None:
                     # Dealing with the latents
-                    subject_pixel_values = batch["subject_pixel_values"].to(dtype=vae.dtype)
+                    subject_pixel_values = batch["subject_pixel_values"].to(device=accelerator.device, dtype=weight_dtype)
                     subject_input = vae.encode(subject_pixel_values).latent_dist.sample()
                     subject_input = (subject_input - vae_config_shift_factor) * vae_config_scaling_factor
                     subject_input = subject_input.to(dtype=weight_dtype)
@@ -1171,11 +1167,12 @@ def main(args):
                     sub_latent_image_ids[:, 1] += offset
                     sub_latent_image_ids = torch.concat([sub_latent_image_ids for _ in range(sub_number)], dim=-2)
                     cond_image_ids_to_concat.append(sub_latent_image_ids)
+                    subject_pixel_values = subject_pixel_values.to("cpu")
                     del subject_pixel_values
                 
                 if args.spatial_column is not None:
                     # Dealing with the latents
-                    cond_pixel_values = batch["cond_pixel_values"].to(device=vae.device, dtype=vae.dtype)             
+                    cond_pixel_values = batch["cond_pixel_values"].to(device=accelerator.device, dtype=weight_dtype)             
                     cond_input = vae.encode(cond_pixel_values).latent_dist.sample()
                     cond_input = (cond_input - vae_config_shift_factor) * vae_config_scaling_factor
                     cond_input = cond_input.to(dtype=weight_dtype)
@@ -1190,71 +1187,87 @@ def main(args):
                     cond_latent_image_ids = repeat(cond_latent_image_ids, "h w c -> b (h w) c", b=bsz)
                     cond_latent_image_ids = torch.concat([cond_latent_image_ids for _ in range(cond_number)], dim=-2)
                     cond_image_ids_to_concat.append(cond_latent_image_ids)
+                    cond_pixel_values = cond_pixel_values.to("cpu")
                     del cond_pixel_values
 
                 cond_image_ids = torch.concat(cond_image_ids_to_concat, dim=-2)
                 cond_input = torch.cat(latents_to_concat, dim=0)
+                pixel_values = pixel_values.to("cpu")
+                vae.to("cpu")
                 del pixel_values
 
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    # Predict the noise residual
+                    model_pred = transformer(
+                        hidden_states=latent_model_input,
+                        cond_hidden_states=cond_input,
+                        cond_img_ids=cond_image_ids,
+                        timesteps=timesteps,
+                        encoder_hidden_states = prompt_embeds,
+                        pooled_embeds = pooled_prompt_embeds,
+                        img_ids=img_ids,
+                        img_sizes=img_sizes,
+                        return_dict=False,
+                    )[0]
+                    # Copied from https://github.com/huggingface/diffusers/blob/f4fa3beee7f49b80ce7a58f9c8002f43299175c9/examples/dreambooth/train_dreambooth_lora_hidream.py#L1613C17-L1613C45
+                    model_pred = model_pred * -1
 
-                # Predict the noise residual
-                model_pred = transformer(
-                    hidden_states=latent_model_input,
-                    cond_hidden_states=cond_input,
-                    cond_img_ids=cond_image_ids,
-                    timesteps=timesteps,
-                    encoder_hidden_states = prompt_embeds,
-                    pooled_embeds = pooled_prompt_embeds,
-                    # NOTE: Keeping the img_ids and img_size as None as the transformer model creates them
-                    img_ids=img_ids,
-                    img_sizes=img_sizes,
-                    return_dict=False,
-                )[0]
-                # Copied from https://github.com/huggingface/diffusers/blob/f4fa3beee7f49b80ce7a58f9c8002f43299175c9/examples/dreambooth/train_dreambooth_lora_hidream.py#L1613C17-L1613C45
-                model_pred = model_pred * -1
+                    print("Prediction Dtype", model_pred.dtype)
+                    # these weighting schemes use a uniform timestep sampling
+                    # and instead post-weight the loss
+                    weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
-                # these weighting schemes use a uniform timestep sampling
-                # and instead post-weight the loss
-                weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+                    # flow matching loss
+                    target = noise - model_input
 
-                # flow matching loss
-                target = noise - model_input
+                    if args.with_prior_preservation:
+                        # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+                        model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                        target, target_prior = torch.chunk(target, 2, dim=0)
 
-                if args.with_prior_preservation:
-                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-                    target, target_prior = torch.chunk(target, 2, dim=0)
+                        # Compute prior loss
+                        prior_loss = torch.mean(
+                            (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2).reshape(
+                                target_prior.shape[0], -1
+                            ),
+                            1,
+                        )
+                        prior_loss = prior_loss.mean()
 
-                    # Compute prior loss
-                    prior_loss = torch.mean(
-                        (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2).reshape(
-                            target_prior.shape[0], -1
-                        ),
+                    # Compute regular loss.
+                    print(weighting.shape, model_pred.shape, target.shape)
+                    loss = torch.mean(
+                        (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
                         1,
                     )
-                    prior_loss = prior_loss.mean()
+                    model_pred = model_pred.cpu(); del model_pred
+                    target = target.cpu(); del target
+                    noise = noise.cpu(); del noise
+                    loss = loss.mean()
+                    gc.collect()
+                    free_memory()
 
-                # Compute regular loss.
-                print(weighting.shape, model_pred.shape, target.shape)
-                loss = torch.mean(
-                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
-                    1,
-                )
+                    if args.with_prior_preservation:
+                        # Add the prior loss to the instance loss.
+                        loss = loss + args.prior_loss_weight * prior_loss
 
-                loss = loss.mean()
+                    
+                    accelerator.backward(loss)
 
-                if args.with_prior_preservation:
-                    # Add the prior loss to the instance loss.
-                    loss = loss + args.prior_loss_weight * prior_loss
+                    
+                    for param in transformer.parameters():
+                        if param.grad is not None:
+                            param.grad.data = param.grad.data.to(torch.float32)
 
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = (transformer.parameters())
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    # grad_norm = None
+                    # if accelerator.sync_gradients and accelerator.distributed_type not in [DistributedType.DEEPSPEED]:
+                    #     if args.max_grad_norm > 0:
+                    #         grad_norm = accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
+                        
 
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -1300,7 +1313,7 @@ def main(args):
             if accelerator.is_main_process:
                 if args.validation_prompt is not None and global_step % args.validation_steps == 0:
                     # create pipeline
-                    pipeline = FluxPipeline.from_pretrained(
+                    pipeline = HiDreamImagePipeline.from_pretrained(
                         args.pretrained_model_name_or_path,
                         vae=vae,
                         text_encoder=accelerator.unwrap_model(text_encoder_one),
