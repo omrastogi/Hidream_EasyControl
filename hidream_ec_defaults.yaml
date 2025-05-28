@@ -1,0 +1,128 @@
+checkpointing:
+  resume_from_checkpoint: null
+  save_every_n_steps: 100
+  save_last_n_steps: 1000
+
+data:
+  local:
+    - "/mnt/dashtoon_data/data_hub/playbook-dataset/mds_shards/aspect-ratio-1.0"
+
+
+  caption_metadata:
+    - "/mnt/dashtoon_data/data_hub/Spawning---PD3M/meta_caption_info_rewritten.jsonl"
+    - "/mnt/dashtoon_data/data_hub/gallery-dl/pinterest_meta_caption_info_rewritten.jsonl"
+    - "/mnt/dashtoon_data/data_hub/playbook-dataset/meta_caption_info_rewritten.jsonl"
+
+
+  batch_size: 1
+  caption_dropout_p: 0.01
+  caption_key: caption
+
+  dataloader_kwargs:
+    drop_last: false
+    num_workers: 32
+    persistent_workers: false
+    pin_memory: true
+    prefetch_factor: 2
+
+  center_crop: false
+  hint_annotators: ['anyline', 'lineart_anime', 'hed', 'lineart', 'pidi', 'canny', 'doodle', 'manga_line', 'scribble', 'scribble_xdog']
+  hint_annotators_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  apply_random_scribble_augmentation_p: 0.20
+
+  aspect_ratio: ASPECT_RATIO_1024
+  image_key: image
+  item_key: __key__
+
+  output_keys:
+    image: pixel_values
+    prompt: prompt
+    mask: mask
+
+  streaming_kwargs:
+    batching_method: per_stream
+    cache_limit: null
+    download_timeout: 12000
+    num_canonical_nodes: 8
+    shuffle: true
+
+experiment:
+  ic_debug: false
+  name: experiment-001
+  output_dirpath: /mnt/data/om
+  random_seed: 42
+  run_id: experiment-001
+
+model:
+  bnb_quantization_config_path: null
+  pretrained_model_name_or_path: "HiDream-ai/HiDream-I1-Full"
+  pretrained_text_encoder_4_name_or_path: "meta-llama/Meta-Llama-3.1-8B-Instruct"
+  pretrained_tokenizer_4_name_or_path: "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
+network:
+  init_lora_weights: "gaussian"
+  lora_alpha: 128
+  lora_dropout: 0.0
+  target_modules:
+    - "double_stream_blocks.*.block.attn*"
+    - "double_stream_blocks.*.block.ff_t*"
+    - "double_stream_blocks.*.block.ff_i.shared_experts*"
+    - "single_stream_blocks.*.block.attn*"
+    - "single_stream_blocks.*.block.ff_i.shared_experts*"
+    - "x_embedder.proj"
+  lora_rank: 128
+  network_type: lora
+
+profiling:
+  enable_memory_snapshot: false
+  enable_profiling: false
+
+training:
+  apply_low_precision_layernorm: false
+  caption_dropout_p: 0.05
+  dit_load_dtype: bf16-mixed
+
+  ema:
+    use_ema: false
+
+  flow_match:
+    discrete_flow_shift: null
+    flow_schedule_auto_shift: true
+    timestep_sampling: sigmoid
+
+  fsdp_enabled: false
+  grad_clip_method: norm
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: false
+  gradient_precision: accelerator
+
+  hidream_load_balancing_loss_weight: 0.01
+  hidream_use_load_balancing_loss: false
+
+  learning_rate: 1e-04
+  log_interval: 1
+
+  lr_scheduler: constant_with_warmup
+  lr_scheduler_num_cycles: 1
+
+  lr_warmup_steps: 100
+  max_grad_norm: 1.0
+
+  num_train_epochs: 100
+  max_train_steps: null
+  mixed_precision: bf16-true
+
+  offload_text_encoding_pipeline: true
+  offload_vae: true
+
+  optimizer_type: optimi-stableadamw
+  optimizer_args:
+    - "betas=(0.9, 0.99)"
+    - "eps=1e-8"
+    - "weight_decay=0.1"
+    - "kahan_sum=True"
+  optimizer_zero_grad_set_to_none: true
+
+  text_encoding_pipeline_load_dtype: bf16
+  text_encoding_pipeline_max_sequence_length: 128
+  text_encoding_pipeline_offload_device: cpu

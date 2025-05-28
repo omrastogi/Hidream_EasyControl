@@ -32,7 +32,14 @@ def batched_load_balancing_loss():
 
 # Modified from https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/model.py
 class MoEGate(nn.Module):
-    def __init__(self, embed_dim, num_routed_experts=4, num_activated_experts=2, aux_loss_alpha=0.01):
+    def __init__(
+        self, 
+        embed_dim, 
+        num_routed_experts=4, 
+        num_activated_experts=2, 
+        aux_loss_alpha=0.01,
+        _force_inference_output=False,
+    ):
         super().__init__()
         self.top_k = num_activated_experts
         self.n_routed_experts = num_routed_experts
@@ -46,6 +53,8 @@ class MoEGate(nn.Module):
         self.gating_dim = embed_dim
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
         self.reset_parameters()
+
+        self._force_inference_output = _force_inference_output
 
     def reset_parameters(self) -> None:
         import torch.nn.init  as init
@@ -71,7 +80,7 @@ class MoEGate(nn.Module):
             topk_weight = topk_weight / denominator
 
         ### expert-level computation auxiliary loss
-        if self.training and self.alpha > 0.0:
+        if self.training and self.alpha > 0.0 and not self._force_inference_output:
             scores_for_aux = scores
             aux_topk = self.top_k
             # always compute aux loss based on the naive greedy topk method
@@ -101,14 +110,17 @@ class MOEFeedForwardSwiGLU(nn.Module):
         hidden_dim: int,
         num_routed_experts: int,
         num_activated_experts: int,
+        _force_inference_output: bool = False,
     ):
         super().__init__()
         self.shared_experts = FeedForwardSwiGLU(dim, hidden_dim // 2)
         self.experts = nn.ModuleList([FeedForwardSwiGLU(dim, hidden_dim) for i in range(num_routed_experts)])
+        self._force_inference_output = _force_inference_output
         self.gate = MoEGate(
             embed_dim = dim, 
             num_routed_experts = num_routed_experts, 
-            num_activated_experts = num_activated_experts
+            num_activated_experts = num_activated_experts,
+            _force_inference_output=_force_inference_output,
         )
         self.num_activated_experts = num_activated_experts
 
@@ -119,7 +131,7 @@ class MOEFeedForwardSwiGLU(nn.Module):
         topk_idx, topk_weight, aux_loss = self.gate(x) 
         x = x.view(-1, x.shape[-1])
         flat_topk_idx = topk_idx.view(-1)
-        if self.training:
+        if self.training and not self._force_inference_output:
             x = x.repeat_interleave(self.num_activated_experts, dim=0)
             y = torch.empty_like(x, dtype=wtype)
             for i, expert in enumerate(self.experts): 

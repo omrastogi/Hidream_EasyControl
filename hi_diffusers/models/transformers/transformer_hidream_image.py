@@ -40,7 +40,8 @@ class HiDreamImageSingleTransformerBlock(nn.Module):
         num_attention_heads: int,
         attention_head_dim: int,
         num_routed_experts: int = 4,
-        num_activated_experts: int = 2
+        num_activated_experts: int = 2,
+        _force_inference_output: bool = False,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -58,7 +59,7 @@ class HiDreamImageSingleTransformerBlock(nn.Module):
             heads=num_attention_heads,
             dim_head=attention_head_dim,
             processor = HiDreamAttnProcessor_flashattn(),
-            single = True
+            single = True,
         )
 
         # 3. Feed-forward
@@ -69,6 +70,7 @@ class HiDreamImageSingleTransformerBlock(nn.Module):
                 hidden_dim = 4 * dim,
                 num_routed_experts = num_routed_experts,
                 num_activated_experts = num_activated_experts,
+                _force_inference_output=_force_inference_output,
             )
         else:
             self.ff_i = FeedForwardSwiGLU(dim = dim, hidden_dim = 4 * dim)
@@ -137,7 +139,8 @@ class HiDreamImageTransformerBlock(nn.Module):
         num_attention_heads: int,
         attention_head_dim: int,
         num_routed_experts: int = 4,
-        num_activated_experts: int = 2
+        num_activated_experts: int = 2,
+         _force_inference_output: bool = False,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -167,6 +170,7 @@ class HiDreamImageTransformerBlock(nn.Module):
                 hidden_dim = 4 * dim,
                 num_routed_experts = num_routed_experts,
                 num_activated_experts = num_activated_experts,
+                _force_inference_output=_force_inference_output,
             )
         else:
             self.ff_i = FeedForwardSwiGLU(dim = dim, hidden_dim = 4 * dim)
@@ -248,6 +252,7 @@ class HiDreamImageBlock(nn.Module):
         num_routed_experts: int = 4,
         num_activated_experts: int = 2,
         block_type: BlockType = BlockType.TransformerBlock,
+         _force_inference_output=False
     ):
         super().__init__()
         block_classes = {
@@ -259,7 +264,8 @@ class HiDreamImageBlock(nn.Module):
             num_attention_heads,
             attention_head_dim,
             num_routed_experts,
-            num_activated_experts
+            num_activated_experts,
+            _force_inference_output
         )
     
     def forward(
@@ -305,6 +311,7 @@ class HiDreamImageTransformer2DModel(
         axes_dims_rope: Tuple[int, int] = (32, 32),
         max_resolution: Tuple[int, int] = (128, 128),
         llama_layers: List[int] = None, 
+        force_inference_output: bool = False,
     ):
         super().__init__()
         self.out_channels = out_channels or in_channels
@@ -328,7 +335,8 @@ class HiDreamImageTransformer2DModel(
                     attention_head_dim = self.config.attention_head_dim,
                     num_routed_experts = num_routed_experts,
                     num_activated_experts = num_activated_experts,
-                    block_type = BlockType.TransformerBlock
+                    block_type = BlockType.TransformerBlock,
+                    _force_inference_output=force_inference_output,
                 )
                 for i in range(self.config.num_layers)
             ]
@@ -342,7 +350,8 @@ class HiDreamImageTransformer2DModel(
                     attention_head_dim = self.config.attention_head_dim,
                     num_routed_experts = num_routed_experts,
                     num_activated_experts = num_activated_experts,
-                    block_type = BlockType.SingleTransformerBlock
+                    block_type = BlockType.SingleTransformerBlock,
+                    _force_inference_output=force_inference_output,
                 )
                 for i in range(self.config.num_single_layers)
             ]
@@ -573,6 +582,12 @@ class HiDreamImageTransformer2DModel(
         ids = torch.cat((img_ids, txt_ids), dim=1)
         rope = self.pe_embedder(ids).to(dtype=hidden_states.dtype)
 
+        logger.debug(f"hidden_states.shape: {hidden_states.shape}")
+        logger.debug(f"cond_hidden_states.shape: {cond_hidden_states.shape if cond_hidden_states is not None else None}")
+        logger.debug(f"img_ids.shape: {img_ids.shape}")
+        logger.debug(f"txt_ids.shape: {txt_ids.shape}")
+        logger.debug(f"rope.shape: {rope.shape}")
+
         # 2. Blocks
         block_id = 0
         initial_encoder_hidden_states = torch.cat([encoder_hidden_states[-1], encoder_hidden_states[-2]], dim=1)
@@ -697,3 +712,6 @@ class HiDreamImageTransformer2DModel(
             return (output, image_tokens_masks)
         return Transformer2DModelOutput(sample=output, mask=image_tokens_masks)
         
+'''
+DIFFUSION_TOOLKIT_PATH=. NUM_OVERFIT_SAMPLES=50 accelerate launch --config_file hidream/control/configs/accelerate_ds.yaml hidream/control/train_hidream_s2c.py --config_path hidream/control/configs/hidream_s2c_defaults.yaml
+'''
