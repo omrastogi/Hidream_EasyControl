@@ -64,6 +64,7 @@ class HiDreamAttention(Attention):
         norm_image_tokens: torch.FloatTensor,
         image_tokens_masks: torch.FloatTensor = None,
         norm_text_tokens: torch.FloatTensor = None,
+        use_cond: bool = None,
         rope: torch.FloatTensor = None,
     ) -> torch.Tensor:
         return self.processor(
@@ -71,6 +72,7 @@ class HiDreamAttention(Attention):
             image_tokens = norm_image_tokens,
             image_tokens_masks = image_tokens_masks,
             text_tokens = norm_text_tokens,
+            use_cond = use_cond,
             rope = rope,
         )
 

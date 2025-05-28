@@ -457,6 +457,249 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
 
         return prompt_embeds, pooled_prompt_embeds
 
+    # Copied and edited from https://github.com/huggingface/diffusers/blob/4267d8f4eb98449d9d29ffbb087d9bdd7690dbab/src/diffusers/pipelines/hidream_image/pipeline_hidream_image.py#L307
+    def encode_all_prompt(
+        self,
+        prompt: Optional[Union[str, List[str]]] = None,
+        prompt_2: Optional[Union[str, List[str]]] = None,
+        prompt_3: Optional[Union[str, List[str]]] = None,
+        prompt_4: Optional[Union[str, List[str]]] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+        num_images_per_prompt: int = 1,
+        do_classifier_free_guidance: bool = True,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        negative_prompt_2: Optional[Union[str, List[str]]] = None,
+        negative_prompt_3: Optional[Union[str, List[str]]] = None,
+        negative_prompt_4: Optional[Union[str, List[str]]] = None,
+        prompt_embeds_t5: Optional[List[torch.FloatTensor]] = None,
+        prompt_embeds_llama3: Optional[List[torch.FloatTensor]] = None,
+        negative_prompt_embeds_t5: Optional[List[torch.FloatTensor]] = None,
+        negative_prompt_embeds_llama3: Optional[List[torch.FloatTensor]] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        max_sequence_length: int = 128,
+        lora_scale: Optional[float] = None,
+    ):
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        if prompt is not None:
+            batch_size = len(prompt)
+        else:
+            batch_size = pooled_prompt_embeds.shape[0]
+
+        device = device or self._execution_device
+
+        if pooled_prompt_embeds is None:
+            pooled_prompt_embeds_1 = self._get_clip_prompt_embeds(
+                self.tokenizer, 
+                self.text_encoder, 
+                prompt = prompt, 
+                num_images_per_prompt = num_images_per_prompt,
+                max_sequence_length = max_sequence_length,
+                device = device,
+                dtype = dtype,
+            )
+
+        if do_classifier_free_guidance and negative_pooled_prompt_embeds is None:
+            negative_prompt = negative_prompt or ""
+            negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+
+            if len(negative_prompt) > 1 and len(negative_prompt) != batch_size:
+                raise ValueError(f"negative_prompt must be of length 1 or {batch_size}")
+
+            negative_pooled_prompt_embeds_1 = self._get_clip_prompt_embeds(
+                self.tokenizer, 
+                self.text_encoder, 
+                prompt = negative_prompt, 
+                num_images_per_prompt = num_images_per_prompt,
+                max_sequence_length = max_sequence_length,
+                device = device,
+                dtype = dtype,
+            )
+
+            if negative_pooled_prompt_embeds_1.shape[0] == 1 and batch_size > 1:
+                negative_pooled_prompt_embeds_1 = negative_pooled_prompt_embeds_1.repeat(batch_size, 1)
+
+        if pooled_prompt_embeds is None:
+            prompt_2 = prompt_2 or prompt
+            prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
+
+            if len(prompt_2) > 1 and len(prompt_2) != batch_size:
+                raise ValueError(f"prompt_2 must be of length 1 or {batch_size}")
+
+            pooled_prompt_embeds_2 = self._get_clip_prompt_embeds(
+                self.tokenizer_2, 
+                self.text_encoder_2, 
+                prompt_2,
+                num_images_per_prompt = num_images_per_prompt,
+                max_sequence_length = max_sequence_length,
+                device = device,
+                dtype = dtype,  
+            )
+
+            if pooled_prompt_embeds_2.shape[0] == 1 and batch_size > 1:
+                pooled_prompt_embeds_2 = pooled_prompt_embeds_2.repeat(batch_size, 1)
+
+        if do_classifier_free_guidance and negative_pooled_prompt_embeds is None:
+            negative_prompt_2 = negative_prompt_2 or negative_prompt
+            negative_prompt_2 = [negative_prompt_2] if isinstance(negative_prompt_2, str) else negative_prompt_2
+
+            if len(negative_prompt_2) > 1 and len(negative_prompt_2) != batch_size:
+                raise ValueError(f"negative_prompt_2 must be of length 1 or {batch_size}")
+
+            negative_pooled_prompt_embeds_2 = self._get_clip_prompt_embeds(
+                self.tokenizer_2, 
+                self.text_encoder_2, 
+                negative_prompt_2,
+                num_images_per_prompt = num_images_per_prompt,
+                max_sequence_length = max_sequence_length,
+                device = device,
+                dtype = dtype,
+            )
+
+            if negative_pooled_prompt_embeds_2.shape[0] == 1 and batch_size > 1:
+                negative_pooled_prompt_embeds_2 = negative_pooled_prompt_embeds_2.repeat(batch_size, 1)
+
+        if pooled_prompt_embeds is None:
+            pooled_prompt_embeds = torch.cat([pooled_prompt_embeds_1, pooled_prompt_embeds_2], dim=-1)
+
+        if do_classifier_free_guidance and negative_pooled_prompt_embeds is None:
+            negative_pooled_prompt_embeds = torch.cat(
+                [negative_pooled_prompt_embeds_1, negative_pooled_prompt_embeds_2], dim=-1
+            )
+
+        if prompt_embeds_t5 is None:
+            prompt_3 = prompt_3 or prompt
+            prompt_3 = [prompt_3] if isinstance(prompt_3, str) else prompt_3
+
+            if len(prompt_3) > 1 and len(prompt_3) != batch_size:
+                raise ValueError(f"prompt_3 must be of length 1 or {batch_size}")
+
+            prompt_embeds_t5 = self._get_t5_prompt_embeds(
+                prompt_3,
+                num_images_per_prompt = num_images_per_prompt,
+                max_sequence_length = max_sequence_length,
+                device = device,
+                dtype = dtype,
+                )
+
+            if prompt_embeds_t5.shape[0] == 1 and batch_size > 1:
+                prompt_embeds_t5 = prompt_embeds_t5.repeat(batch_size, 1, 1)
+
+        if do_classifier_free_guidance and negative_prompt_embeds_t5 is None:
+            negative_prompt_3 = negative_prompt_3 or negative_prompt
+            negative_prompt_3 = [negative_prompt_3] if isinstance(negative_prompt_3, str) else negative_prompt_3
+
+            if len(negative_prompt_3) > 1 and len(negative_prompt_3) != batch_size:
+                raise ValueError(f"negative_prompt_3 must be of length 1 or {batch_size}")
+
+            negative_prompt_embeds_t5 = self._get_t5_prompt_embeds(
+                negative_prompt_3, 
+                num_images_per_prompt = num_images_per_prompt,
+                max_sequence_length = max_sequence_length,
+                device = device,
+                dtype = dtype,
+            )
+
+            if negative_prompt_embeds_t5.shape[0] == 1 and batch_size > 1:
+                negative_prompt_embeds_t5 = negative_prompt_embeds_t5.repeat(batch_size, 1, 1)
+
+        if prompt_embeds_llama3 is None:
+            prompt_4 = prompt_4 or prompt
+            prompt_4 = [prompt_4] if isinstance(prompt_4, str) else prompt_4
+
+            if len(prompt_4) > 1 and len(prompt_4) != batch_size:
+                raise ValueError(f"prompt_4 must be of length 1 or {batch_size}")
+
+            prompt_embeds_llama3 = self._get_llama3_prompt_embeds(
+                prompt_4, 
+                num_images_per_prompt = num_images_per_prompt,
+                max_sequence_length = max_sequence_length,
+                device = device,
+                dtype = dtype,
+                )
+
+            if prompt_embeds_llama3.shape[0] == 1 and batch_size > 1:
+                prompt_embeds_llama3 = prompt_embeds_llama3.repeat(1, batch_size, 1, 1)
+
+        if do_classifier_free_guidance and negative_prompt_embeds_llama3 is None:
+            negative_prompt_4 = negative_prompt_4 or negative_prompt
+            negative_prompt_4 = [negative_prompt_4] if isinstance(negative_prompt_4, str) else negative_prompt_4
+
+            if len(negative_prompt_4) > 1 and len(negative_prompt_4) != batch_size:
+                raise ValueError(f"negative_prompt_4 must be of length 1 or {batch_size}")
+
+            negative_prompt_embeds_llama3 = self._get_llama3_prompt_embeds(
+                negative_prompt_4, 
+                num_images_per_prompt = num_images_per_prompt,
+                max_sequence_length = max_sequence_length,
+                device = device,
+                dtype = dtype,
+            )
+
+            if negative_prompt_embeds_llama3.shape[0] == 1 and batch_size > 1:
+                negative_prompt_embeds_llama3 = negative_prompt_embeds_llama3.repeat(1, batch_size, 1, 1)
+
+        # duplicate pooled_prompt_embeds for each generation per prompt
+        pooled_prompt_embeds = pooled_prompt_embeds.repeat(1, num_images_per_prompt)
+        pooled_prompt_embeds = pooled_prompt_embeds.view(batch_size * num_images_per_prompt, -1)
+
+        # duplicate t5_prompt_embeds for batch_size and num_images_per_prompt
+        bs_embed, seq_len, _ = prompt_embeds_t5.shape
+        if bs_embed == 1 and batch_size > 1:
+            prompt_embeds_t5 = prompt_embeds_t5.repeat(batch_size, 1, 1)
+        elif bs_embed > 1 and bs_embed != batch_size:
+            raise ValueError(f"cannot duplicate prompt_embeds_t5 of batch size {bs_embed}")
+        prompt_embeds_t5 = prompt_embeds_t5.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds_t5 = prompt_embeds_t5.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+        # duplicate llama3_prompt_embeds for batch_size and num_images_per_prompt
+        _, bs_embed, seq_len, dim = prompt_embeds_llama3.shape
+        if bs_embed == 1 and batch_size > 1:
+            prompt_embeds_llama3 = prompt_embeds_llama3.repeat(1, batch_size, 1, 1)
+        elif bs_embed > 1 and bs_embed != batch_size:
+            raise ValueError(f"cannot duplicate prompt_embeds_llama3 of batch size {bs_embed}")
+        prompt_embeds_llama3 = prompt_embeds_llama3.repeat(1, 1, num_images_per_prompt, 1)
+        prompt_embeds_llama3 = prompt_embeds_llama3.view(-1, batch_size * num_images_per_prompt, seq_len, dim)
+
+        if do_classifier_free_guidance:
+            # duplicate negative_pooled_prompt_embeds for batch_size and num_images_per_prompt
+            bs_embed, seq_len = negative_pooled_prompt_embeds.shape
+            if bs_embed == 1 and batch_size > 1:
+                negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.repeat(batch_size, 1)
+            elif bs_embed > 1 and bs_embed != batch_size:
+                raise ValueError(f"cannot duplicate negative_pooled_prompt_embeds of batch size {bs_embed}")
+            negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.repeat(1, num_images_per_prompt)
+            negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.view(batch_size * num_images_per_prompt, -1)
+
+            # duplicate negative_t5_prompt_embeds for batch_size and num_images_per_prompt
+            bs_embed, seq_len, _ = negative_prompt_embeds_t5.shape
+            if bs_embed == 1 and batch_size > 1:
+                negative_prompt_embeds_t5 = negative_prompt_embeds_t5.repeat(batch_size, 1, 1)
+            elif bs_embed > 1 and bs_embed != batch_size:
+                raise ValueError(f"cannot duplicate negative_prompt_embeds_t5 of batch size {bs_embed}")
+            negative_prompt_embeds_t5 = negative_prompt_embeds_t5.repeat(1, num_images_per_prompt, 1)
+            negative_prompt_embeds_t5 = negative_prompt_embeds_t5.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+            # duplicate negative_prompt_embeds_llama3 for batch_size and num_images_per_prompt
+            _, bs_embed, seq_len, dim = negative_prompt_embeds_llama3.shape
+            if bs_embed == 1 and batch_size > 1:
+                negative_prompt_embeds_llama3 = negative_prompt_embeds_llama3.repeat(1, batch_size, 1, 1)
+            elif bs_embed > 1 and bs_embed != batch_size:
+                raise ValueError(f"cannot duplicate negative_prompt_embeds_llama3 of batch size {bs_embed}")
+            negative_prompt_embeds_llama3 = negative_prompt_embeds_llama3.repeat(1, 1, num_images_per_prompt, 1)
+            negative_prompt_embeds_llama3 = negative_prompt_embeds_llama3.view(
+                -1, batch_size * num_images_per_prompt, seq_len, dim
+            )
+
+        return (
+            prompt_embeds_t5,
+            negative_prompt_embeds_t5,
+            prompt_embeds_llama3,
+            negative_prompt_embeds_llama3,
+            pooled_prompt_embeds,
+            negative_pooled_prompt_embeds,
+        )
     # Copied from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3_inpaint.StableDiffusion3InpaintPipeline._encode_vae_image
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
         if isinstance(generator, list):
@@ -559,8 +802,9 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             subject_image_latents = self._encode_vae_image(image=subject_image, generator=generator)
             latents_to_concat.append(subject_image_latents.unsqueeze(0))
             latent_image_ids = torch.zeros(height_cond // 2, width_cond // 2, 3, device=device, dtype=dtype)
-            latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height_cond // 2, device=device)[:, None] + 64 # fixed offset
+            latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height_cond // 2, device=device)[:, None] 
             latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width_cond // 2, device=device)[None, :]
+            latent_image_ids[:,1] += + 64 # fixed offset
             latent_image_ids = repeat(latent_image_ids, "h w c -> b (h w) c", b=batch_size)
             subject_latent_image_ids = torch.concat([latent_image_ids for _ in range(sub_number)], dim=-2)
             latents_ids_to_concat.append(subject_latent_image_ids)
@@ -581,8 +825,9 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             latents_ids_to_concat.append(cond_latent_image_ids)
             
 
-        cond_latents = torch.concat(latents_to_concat, dim=0)
-        cond_img_id = torch.concat(latents_ids_to_concat, dim=-2)
+        # Concatenate or return Non
+        cond_latents = torch.cat(latents_to_concat, dim=0) if latents_to_concat else None
+        cond_img_id = torch.cat(latents_ids_to_concat, dim=-2) if latents_ids_to_concat else None
         return latents, cond_latents, cond_img_id
     
     @property

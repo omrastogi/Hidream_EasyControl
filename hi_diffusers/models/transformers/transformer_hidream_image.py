@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, Union, List
 
 import torch
 import torch.nn as nn
@@ -14,6 +14,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from ..embeddings import PatchEmbed, PooledEmbed, TimestepEmbed, EmbedND, OutEmbed
 from ..attention import HiDreamAttention, FeedForwardSwiGLU
 from ..attention_processor import HiDreamAttnProcessor_flashattn
+from diffusers.models.attention_processor import AttentionProcessor
 from ..moe import MOEFeedForwardSwiGLU
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -75,32 +76,58 @@ class HiDreamImageSingleTransformerBlock(nn.Module):
     def forward(
         self,
         image_tokens: torch.FloatTensor,
+        cond_tokens: Optional[torch.FloatTensor] = None,
         image_tokens_masks: Optional[torch.FloatTensor] = None,
         text_tokens: Optional[torch.FloatTensor] = None,
         adaln_input: Optional[torch.FloatTensor] = None,
+        cond_adaln_input: Optional[torch.FloatTensor] = None,
         rope: torch.FloatTensor = None,
-
     ) -> torch.FloatTensor:
+        use_cond = cond_tokens is not None
         wtype = image_tokens.dtype
         shift_msa_i, scale_msa_i, gate_msa_i, shift_mlp_i, scale_mlp_i, gate_mlp_i = \
             self.adaLN_modulation(adaln_input)[:,None].chunk(6, dim=-1)
         
+        if use_cond:
+            cond_shift_msa_i, cond_scale_msa_i, cond_gate_msa_i, cond_shift_mlp_i, cond_scale_mlp_i, cond_gate_mlp_i = \
+            self.adaLN_modulation(cond_adaln_input)[:,None].chunk(6, dim=-1)
+        
         # 1. MM-Attention
         norm_image_tokens = self.norm1_i(image_tokens).to(dtype=wtype)
         norm_image_tokens = norm_image_tokens * (1 + scale_msa_i) + shift_msa_i
+        if use_cond:
+            norm_cond_tokens = self.norm1_i(cond_tokens).to(dtype=wtype)
+            norm_cond_tokens = norm_cond_tokens * (1 + cond_scale_msa_i) + cond_shift_msa_i
+            norm_image_tokens = torch.concat([norm_image_tokens, norm_cond_tokens], dim=-2)
+
         attn_output_i = self.attn1(
             norm_image_tokens,
             image_tokens_masks,
+            use_cond = use_cond,
             rope = rope,
         )
+
+        if use_cond:
+            attn_output_i, cond_attn_output = attn_output_i
+        else:
+            cond_attn_output = None
+
         image_tokens = gate_msa_i * attn_output_i + image_tokens
+        if use_cond:
+            cond_tokens = cond_gate_msa_i * cond_attn_output + cond_tokens
         
         # 2. Feed-forward
         norm_image_tokens = self.norm3_i(image_tokens).to(dtype=wtype)
         norm_image_tokens = norm_image_tokens * (1 + scale_mlp_i) + shift_mlp_i
         ff_output_i = gate_mlp_i * self.ff_i(norm_image_tokens.to(dtype=wtype))
         image_tokens = ff_output_i + image_tokens
-        return image_tokens
+        if use_cond:
+            norm_cond_tokens = self.norm3_i(cond_tokens).to(dtype=wtype)
+            norm_cond_tokens = norm_cond_tokens * (1 + cond_scale_mlp_i) + cond_shift_mlp_i
+            cond_ff_output = cond_gate_mlp_i * self.ff_i(norm_cond_tokens)
+            cond_tokens = cond_ff_output + cond_tokens
+
+        return image_tokens, cond_tokens
 
 @maybe_allow_in_graph
 class HiDreamImageTransformerBlock(nn.Module):
@@ -149,15 +176,22 @@ class HiDreamImageTransformerBlock(nn.Module):
     def forward(
         self,
         image_tokens: torch.FloatTensor,
+        cond_tokens: Optional[torch.FloatTensor] = None,
         image_tokens_masks: Optional[torch.FloatTensor] = None,
         text_tokens: Optional[torch.FloatTensor] = None,
         adaln_input: Optional[torch.FloatTensor] = None,
+        cond_adaln_input: Optional[torch.FloatTensor] = None,
         rope: torch.FloatTensor = None,
     ) -> torch.FloatTensor:
+        use_cond = cond_tokens is not None
         wtype = image_tokens.dtype
         shift_msa_i, scale_msa_i, gate_msa_i, shift_mlp_i, scale_mlp_i, gate_mlp_i, \
         shift_msa_t, scale_msa_t, gate_msa_t, shift_mlp_t, scale_mlp_t, gate_mlp_t = \
             self.adaLN_modulation(adaln_input)[:,None].chunk(12, dim=-1)
+        
+        if use_cond:
+            cond_shift_msa_i, cond_scale_msa_i, cond_gate_msa_i, cond_shift_mlp_i, cond_scale_mlp_i, cond_gate_mlp_i,\
+            _, _, _, _, _, _ = self.adaLN_modulation(cond_adaln_input)[:, None].chunk(12, dim=-1)
         
         # 1. MM-Attention
         norm_image_tokens = self.norm1_i(image_tokens).to(dtype=wtype)
@@ -165,27 +199,44 @@ class HiDreamImageTransformerBlock(nn.Module):
         norm_text_tokens = self.norm1_t(text_tokens).to(dtype=wtype)
         norm_text_tokens = norm_text_tokens * (1 + scale_msa_t) + shift_msa_t
 
-        attn_output_i, attn_output_t = self.attn1(
+        if use_cond:
+            norm_cond_tokens = self.norm1_i(cond_tokens).to(dtype=wtype)
+            norm_cond_tokens = norm_cond_tokens * (1 + cond_scale_msa_i) + cond_shift_msa_i
+            norm_image_tokens = torch.concat([norm_image_tokens, norm_cond_tokens], dim=-2)
+
+        attn_output = self.attn1(
             norm_image_tokens,
             image_tokens_masks,
             norm_text_tokens,
             rope = rope,
         )
 
+        attn_output_i, attn_output_t = attn_output[:2]
+        cond_attn_output = attn_output[2] if use_cond else None
+
         image_tokens = gate_msa_i * attn_output_i + image_tokens
         text_tokens = gate_msa_t * attn_output_t + text_tokens
+        if use_cond:
+            cond_tokens = cond_gate_msa_i * cond_attn_output + cond_tokens
         
         # 2. Feed-forward
         norm_image_tokens = self.norm3_i(image_tokens).to(dtype=wtype)
         norm_image_tokens = norm_image_tokens * (1 + scale_mlp_i) + shift_mlp_i
         norm_text_tokens = self.norm3_t(text_tokens).to(dtype=wtype)
         norm_text_tokens = norm_text_tokens * (1 + scale_mlp_t) + shift_mlp_t
+        if use_cond:
+            norm_cond_tokens = self.norm3_i(cond_tokens).to(dtype=wtype)
+            norm_cond_tokens = norm_cond_tokens * (1 + cond_scale_mlp_i) + cond_shift_mlp_i
 
         ff_output_i = gate_mlp_i * self.ff_i(norm_image_tokens)
         ff_output_t = gate_mlp_t * self.ff_t(norm_text_tokens)
         image_tokens = ff_output_i + image_tokens
         text_tokens = ff_output_t + text_tokens
-        return image_tokens, text_tokens
+        if use_cond:
+            cond_ff_output = cond_gate_mlp_i * self.ff_i(norm_cond_tokens)
+            cond_tokens = cond_ff_output + cond_tokens
+
+        return image_tokens, text_tokens, cond_tokens
     
 @maybe_allow_in_graph
 class HiDreamImageBlock(nn.Module):
@@ -214,16 +265,20 @@ class HiDreamImageBlock(nn.Module):
     def forward(
         self,
         image_tokens: torch.FloatTensor,
+        cond_tokens: Optional[torch.FloatTensor] = None,
         image_tokens_masks: Optional[torch.FloatTensor] = None,
         text_tokens: Optional[torch.FloatTensor] = None,
         adaln_input: torch.FloatTensor = None,
+        cond_adaln_input: Optional[torch.FloatTensor] = None,
         rope: torch.FloatTensor = None,
     ) -> torch.FloatTensor:
         return self.block(
             image_tokens,
+            cond_tokens,
             image_tokens_masks,
             text_tokens,
             adaln_input,
+            cond_adaln_input,
             rope,
         )
 
@@ -322,9 +377,15 @@ class HiDreamImageTransformer2DModel(
         timesteps = timesteps.expand(batch_size)
         return timesteps
 
-    def unpatchify(self, x: torch.Tensor, img_sizes: List[Tuple[int, int]], is_training: bool) -> List[torch.Tensor]:            
+    def unpatchify(self, x: torch.Tensor, img_sizes: List[Tuple[int, int]], is_training: bool) -> List[torch.Tensor]:   
+        is_training = False         
         if is_training:
-            x = einops.rearrange(x, 'B S (p1 p2 C) -> B C S (p1 p2)', p1=self.config.patch_size, p2=self.config.patch_size)
+            # x = einops.rearrange(x, 'B S (p1 p2 C) -> B C S (p1 p2)', p1=self.config.patch_size, p2=self.config.patch_size)
+            B, S, F = x.shape
+            C = F // (self.config.patch_size * self.config.patch_size)
+            x = x.reshape(B, S, self.config.patch_size, self.config.patch_size, C).permute(0, 4, 1, 2, 3).reshape(B, C, S, self.config.patch_size * self.config.patch_size)
+            print(B, S, F)
+            print(x.shape)
         else:
             x_arr = []
             for i, img_size in enumerate(img_sizes):
@@ -335,6 +396,66 @@ class HiDreamImageTransformer2DModel(
                 )
             x = torch.cat(x_arr, dim=0)
         return x
+
+    @property
+    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.attn_processors
+    def attn_processors(self) -> Dict[str, AttentionProcessor]:
+        r"""
+        Returns:
+            `dict` of attention processors: A dictionary containing all attention processors used in the model with
+            indexed by its weight name.
+        """
+        # set recursively
+        processors = {}
+
+        def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors: Dict[str, AttentionProcessor]):
+            if hasattr(module, "get_processor"):
+                processors[f"{name}.processor"] = module.get_processor()
+
+            for sub_name, child in module.named_children():
+                fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
+
+            return processors
+
+        for name, module in self.named_children():
+            fn_recursive_add_processors(name, module, processors)
+
+        return processors
+
+    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.set_attn_processor
+    def set_attn_processor(self, processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]]):
+        r"""
+        Sets the attention processor to use to compute attention.
+
+        Parameters:
+            processor (`dict` of `AttentionProcessor` or only `AttentionProcessor`):
+                The instantiated processor class or a dictionary of processor classes that will be set as the processor
+                for **all** `Attention` layers.
+
+                If `processor` is a dict, the key needs to define the path to the corresponding cross attention
+                processor. This is strongly recommended when setting trainable attention processors.
+
+        """
+        count = len(self.attn_processors.keys())
+
+        if isinstance(processor, dict) and len(processor) != count:
+            raise ValueError(
+                f"A dict of processors was passed, but the number of processors {len(processor)} does not match the"
+                f" number of attention layers: {count}. Please make sure to pass {count} processor classes."
+            )
+
+        def fn_recursive_attn_processor(name: str, module: torch.nn.Module, processor):
+            if hasattr(module, "set_processor"):
+                if not isinstance(processor, dict):
+                    module.set_processor(processor)
+                else:
+                    module.set_processor(processor.pop(f"{name}.processor"))
+
+            for sub_name, child in module.named_children():
+                fn_recursive_attn_processor(f"{name}.{sub_name}", child, processor)
+
+        for name, module in self.named_children():
+            fn_recursive_attn_processor(name, module, processor)
 
     def patchify(self, x, max_seq, img_sizes=None):
         pz2 = self.config.patch_size * self.config.patch_size
@@ -399,9 +520,12 @@ class HiDreamImageTransformer2DModel(
 
         # 0. time
         timesteps = self.expand_timesteps(timesteps, batch_size, hidden_states.device)
+        cond_timesteps = torch.ones_like(timesteps) * 0
         timesteps = self.t_embedder(timesteps, hidden_states_type)
         p_embedder = self.p_embedder(pooled_embeds)
         adaln_input = timesteps + p_embedder
+        cond_timesteps = self.t_embedder(cond_timesteps, hidden_states_type)
+        cond_adaln_input = timesteps + p_embedder
 
         hidden_states, image_tokens_masks, img_sizes = self.patchify(hidden_states, self.max_seq, img_sizes)
 
@@ -421,7 +545,9 @@ class HiDreamImageTransformer2DModel(
                 latents_to_concat.append(cond_latent)
             cond_hidden_states = torch.concat(latents_to_concat, dim=-2)
             cond_hidden_states = self.x_embedder(cond_hidden_states)
-
+            img_ids = torch.concat([img_ids, cond_img_ids], dim=-2)
+        
+        img_ids = img_ids.to(dtype=hidden_states.dtype)
 
         T5_encoder_hidden_states = encoder_hidden_states[0]
         encoder_hidden_states = encoder_hidden_states[-1]
@@ -445,7 +571,7 @@ class HiDreamImageTransformer2DModel(
             device=img_ids.device, dtype=img_ids.dtype
         )
         ids = torch.cat((img_ids, txt_ids), dim=1)
-        rope = self.pe_embedder(ids)
+        rope = self.pe_embedder(ids).to(dtype=hidden_states.dtype)
 
         # 2. Blocks
         block_id = 0
@@ -464,22 +590,37 @@ class HiDreamImageTransformer2DModel(
                     return custom_forward
                 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                hidden_states, initial_encoder_hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    hidden_states,
-                    image_tokens_masks,
-                    cur_encoder_hidden_states,
-                    adaln_input,
-                    rope,
-                    **ckpt_kwargs,
-                )
+                if use_condition:
+                    hidden_states, initial_encoder_hidden_states, cond_hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        hidden_states,             # image_tokens
+                        cond_hidden_states,        # cond_tokens
+                        image_tokens_masks,        # image_tokens_masks
+                        cur_encoder_hidden_states, # text_tokens
+                        adaln_input,               # adaln_input
+                        cond_adaln_input,          # cond_adaln_input
+                        rope,                      # rope
+                        **ckpt_kwargs,
+                    )
+                else:
+                    hidden_states, initial_encoder_hidden_states, cond_hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        hidden_states,             # image_tokens
+                        image_tokens_masks,        # image_tokens_masks
+                        cur_encoder_hidden_states, # text_tokens
+                        adaln_input,               # adaln_input
+                        rope,                      # rope
+                        **ckpt_kwargs,
+                    )
             else:
-                hidden_states, initial_encoder_hidden_states = block(
+                hidden_states, initial_encoder_hidden_states, cond_hidden_states = block(
                     image_tokens = hidden_states,
                     image_tokens_masks = image_tokens_masks,
                     text_tokens = cur_encoder_hidden_states,
                     adaln_input = adaln_input,
                     rope = rope,
+                    cond_tokens=cond_hidden_states if use_condition else None,
+                    cond_adaln_input=cond_adaln_input if use_condition else None,
                 )
             initial_encoder_hidden_states = initial_encoder_hidden_states[:, :initial_encoder_hidden_states_seq_len]
             block_id += 1
@@ -507,21 +648,36 @@ class HiDreamImageTransformer2DModel(
                     return custom_forward
                 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    hidden_states,
-                    image_tokens_masks,
-                    None,
-                    adaln_input,
-                    rope,
-                    **ckpt_kwargs,
-                )
+                if use_condition:
+                    hidden_states, cond_hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        hidden_states,
+                        cond_hidden_states,
+                        image_tokens_masks,
+                        None,
+                        adaln_input,
+                        cond_adaln_input,
+                        rope,
+                        **ckpt_kwargs,
+                    )
+                else:
+                    hidden_states, cond_hidden_stat = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        hidden_states,
+                        image_tokens_masks,
+                        None,
+                        adaln_input,
+                        rope,
+                        **ckpt_kwargs,
+                    )
             else:
-                hidden_states = block(
+                hidden_states, cond_hidden_stat = block(
                     image_tokens = hidden_states,
                     image_tokens_masks = image_tokens_masks,
                     text_tokens = None,
                     adaln_input = adaln_input,
+                    cond_tokens=cond_hidden_states if use_condition else None,
+                    cond_adaln_input=cond_adaln_input if use_condition else None,
                     rope = rope,
                 )
             hidden_states = hidden_states[:, :hidden_states_seq_len]
