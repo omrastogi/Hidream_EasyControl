@@ -12,6 +12,8 @@ args = parser.parse_args()
 model_type = args.model_type
 MODEL_PREFIX = "HiDream-ai"
 LLAMA_MODEL_NAME = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+from hi_diffusers.models.lora_helper import MultiDoubleStreamBlockLoraProcessor, MultiSingleStreamBlockLoraProcessor
+ 
 
 # Model configurations
 MODEL_CONFIGS = {
@@ -115,11 +117,17 @@ def generate_image(pipe, model_type, prompt, resolution, seed):
         seed = torch.randint(0, 1000000, (1,)).item()
     
     generator = torch.Generator("cuda").manual_seed(seed)
-    
 
-    prompt = "A SKS on the car"
-    subject_images = [Image.open("./test_imgs/subject_1.png").convert("RGB")]
-    spatial_images = [Image.open("./test_imgs/inpainting.png").convert("RGB")]
+    use_cond = True
+
+    if use_cond:
+        prompt = "A SKS on the car"
+        # subject_images = [Image.open("./test_imgs/subject_1.png").convert("RGB")]
+        spatial_images = [Image.open("./test_imgs/inpainting.png").convert("RGB")]
+    else:
+        prompt = "A SKS on the car"
+        subject_images = []
+        spatial_images = []
     # subject_images = []
     images = pipe(
         prompt,
@@ -129,7 +137,7 @@ def generate_image(pipe, model_type, prompt, resolution, seed):
         num_inference_steps=num_inference_steps,
         num_images_per_prompt=1,
         generator=generator,
-        subject_images=subject_images,
+        subject_images=[],
         spatial_images=spatial_images,
         cond_size=512,        
     ).images
@@ -138,7 +146,45 @@ def generate_image(pipe, model_type, prompt, resolution, seed):
 
 # Initialize with default model
 print("Loading default model (full)...")
+
 pipe, _ = load_models(model_type)
+use_cond = True
+##############################
+if use_cond:
+    lora_attn_procs = {}
+    import re
+    number = 1
+    ranks = [64]
+    cond_size = 512
+    double_blocks_idx = list(range(16))
+    single_blocks_idx = list(range(32))
+    for name, attn_processor in pipe.transformer.attn_processors.items():
+        match = re.search(r'\.(\d+)\.', name)
+        if match:
+            layer_index = int(match.group(1))
+        if name.startswith("double_stream_blocks") and layer_index in double_blocks_idx:
+            print("setting LoRA Processor for", name)
+            lora_attn_procs[name] = MultiDoubleStreamBlockLoraProcessor(
+                        dim=2560, ranks=ranks, network_alphas=ranks, lora_weights=[1 for _ in range(number)], device=pipe.device, dtype=pipe.dtype, cond_width=cond_size, cond_height=cond_size, n_loras=number
+                    )
+        elif name.startswith("single_stream_blocks") and layer_index in single_blocks_idx:
+            print("setting LoRA Processor for", name)
+            lora_attn_procs[name] = MultiSingleStreamBlockLoraProcessor(
+                        dim=2560, ranks=ranks, network_alphas=ranks, lora_weights=[1 for _ in range(number)], device=pipe.device, dtype=pipe.dtype, cond_width=cond_size, cond_height=cond_size, n_loras=number
+                    )
+        else:
+            lora_attn_procs[name] = attn_processor
+    pipe.transformer.set_attn_processor(lora_attn_procs)
+##################################
+
+from safetensors.torch import load_file
+checkpoint_path = "/mnt/data/om/experiment-001/checkpoint-step00001100/model.safetensors"
+
+state_dict = load_file(checkpoint_path)
+pipe.transformer.load_state_dict(state_dict, strict=False)
+# No need to reload or reinitialize state_dict; just use the one already loaded above.
+del state_dict
+
 print("Model loaded successfully!")
 prompt = "A cat holding a sign that says \"Hi-Dreams.ai\"." 
 resolution = "1024 × 1024 (Square)"
